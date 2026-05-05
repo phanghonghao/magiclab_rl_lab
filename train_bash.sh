@@ -23,7 +23,7 @@ TRAIN_SCRIPT="scripts/rsl_rl/train.py"
 # Use nohup for background training, logs saved to train_z1.log
 nohup $PYTHON $TRAIN_SCRIPT \
     --task=Magiclab-Z1-12dof-Velocity \
-    --run_name=z1_locomotion_v1 \
+    --run_name=z1_locomotion_s1 \
     --headless \
     --max_iterations=50000 \
     --num_envs=8192 \
@@ -37,7 +37,7 @@ echo "TensorBoard:  tensorboard --logdir logs/rsl_rl/ --port 6006 --bind_all"
 # === Resume Training (uncomment to resume from checkpoint) ===
 # $PYTHON $TRAIN_SCRIPT \
 #     --task=Magiclab-Z1-12dof-Velocity \
-#     --run_name=z1_locomotion_v1_resume \
+#     --run_name=z1_locomotion_s1_resume \
 #     --headless \
 #     --max_iterations=50000 \
 #     --num_envs=8192 \

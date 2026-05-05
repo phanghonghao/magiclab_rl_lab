@@ -6,12 +6,12 @@
 import os
 
 import isaaclab.sim as sim_utils
-from isaaclab.actuators import IdealPDActuatorCfg, ImplicitActuatorCfg
+from isaaclab.actuators import IdealPDActuatorCfg
 from isaaclab.assets.articulation import ArticulationCfg
 from isaaclab.utils import configclass
 
 MAGICLAB_MODEL_DIR = "path/to/magiclab_model"  # Replace with the actual path to your magiclab_model directory
-MAGICLAB_ROS_DIR = "/home/ubuntu/xbh/ws/magiclab_lab_clean"  # Replace with the actual path to your magiclab_ros package
+MAGICLAB_ROS_DIR = "/home/phh/magiclab_rl_lab"  # RTX PRO 6000D server
 
 
 @configclass
@@ -103,15 +103,15 @@ MAGICLAB_Z1_12DOF_CFG = MagiclabArticulationCfg(
         joint_vel={".*": 0.0},
     ),
     actuators={
-        "legs": ImplicitActuatorCfg(
+        "legs": IdealPDActuatorCfg(
             joint_names_expr=[
                 ".*_hip_roll_joint",
                 ".*_hip_yaw_joint",
                 ".*_hip_pitch_joint",
                 ".*_knee_joint",
             ],
-            effort_limit_sim=120,
-            velocity_limit_sim=20,
+            effort_limit=120,
+            velocity_limit=20,
             stiffness={
                 ".*_hip_pitch_joint": 100.0,
                 ".*_hip_roll_joint": 100.0,
@@ -129,9 +129,9 @@ MAGICLAB_Z1_12DOF_CFG = MagiclabArticulationCfg(
                 ".*_knee.*": 0.02863,
             },
         ),
-        "feet": ImplicitActuatorCfg(
-            effort_limit_sim=50,
-            velocity_limit_sim=15,
+        "feet": IdealPDActuatorCfg(
+            effort_limit=50,
+            velocity_limit=15,
             joint_names_expr=[".*_ankle_pitch_joint", ".*_ankle_roll_joint.*"],
             stiffness=60.0,
             damping=3.0,

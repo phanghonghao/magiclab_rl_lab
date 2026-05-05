@@ -10,15 +10,21 @@ Pure Python — only needs torch + tensorboard + stdlib (already in the
 training environment).  Does NOT launch Isaac Sim.
 
 Usage:
-    # Continuous monitoring (run alongside training on RTX6000)
+    # Realtime: focus on currently training run, compact live updates
+    python scripts/train_monitor.py --realtime --terrain gentle
+
+    # One-shot retrospective analysis of all runs
+    python scripts/train_monitor.py --once --terrain gentle
+
+    # One-shot analysis of a single finished run
+    python scripts/train_monitor.py --once \
+        --run_dir logs/rsl_rl/.../2026-05-01_04-50-05_z1_locomotion_s4_gentle_terrain
+
+    # Continuous background monitoring of all runs
     nohup python scripts/train_monitor.py \
         --log_root logs/rsl_rl/magiclab_z1_12dof_velocity \
         --terrain gentle --poll_interval 120 \
         > monitor.log 2>&1 &
-
-    # One-shot retrospective analysis of a finished run
-    python scripts/train_monitor.py --once \
-        --run_dir logs/rsl_rl/.../2026-05-01_04-50-05_z1_locomotion_v4_gentle_terrain
 
     # Continuous with auto-export of best model
     python scripts/train_monitor.py --auto_export --terrain gentle
@@ -87,6 +93,7 @@ class MonitorConfig:
 
     # Mode
     once: bool = False
+    realtime: bool = False
 
     def __post_init__(self):
         # Override thresholds from terrain presets
@@ -106,7 +113,14 @@ TAG_ACTION_RATE = "Episode_Reward/action_rate"
 TAG_VALUE_LOSS = "Loss/value_function"
 TAG_ENTROPY = "Loss/entropy"
 
-ALL_TAGS = [TAG_REWARD, TAG_ACTION_RATE, TAG_VALUE_LOSS, TAG_ENTROPY]
+# Behavioral metrics (cross-run comparable)
+TAG_EP_LEN = "Train/mean_episode_length"
+TAG_TIME_OUT = "Episode_Termination/time_out"
+TAG_BAD_ORI = "Episode_Termination/bad_orientation"
+TAG_VEL_ERR = "Metrics/base_velocity/error_vel_xy"
+
+ALL_TAGS = [TAG_REWARD, TAG_ACTION_RATE, TAG_VALUE_LOSS, TAG_ENTROPY,
+            TAG_EP_LEN, TAG_TIME_OUT, TAG_BAD_ORI, TAG_VEL_ERR]
 
 
 class TensorBoardParser:
@@ -246,6 +260,11 @@ class RunState:
     action_rates: list[tuple[int, float]] = field(default_factory=list)
     value_losses: list[tuple[int, float]] = field(default_factory=list)
     entropies: list[tuple[int, float]] = field(default_factory=list)
+    # Behavioral metrics (cross-run comparable)
+    episode_lengths: list[tuple[int, float]] = field(default_factory=list)
+    time_outs: list[tuple[int, float]] = field(default_factory=list)
+    bad_orientations: list[tuple[int, float]] = field(default_factory=list)
+    vel_errors: list[tuple[int, float]] = field(default_factory=list)
     # Checkpoint data
     checkpoints: list[Path] = field(default_factory=list)
     std_values: dict[int, float] = field(default_factory=dict)  # iter -> std
@@ -467,6 +486,17 @@ class ReportGenerator:
         )
         print(line)
 
+        # Behavioral metrics line
+        if state.time_outs or state.episode_lengths:
+            to_val = state.time_outs[-1][1] if state.time_outs else 0
+            ep_val = state.episode_lengths[-1][1] if state.episode_lengths else 0
+            bo_val = state.bad_orientations[-1][1] if state.bad_orientations else 0
+            ve_val = state.vel_errors[-1][1] if state.vel_errors else 0
+            print(
+                f"  [BEHAVIOR] time_out: {to_val:.1%} | ep_len: {ep_val:.0f}/1000 | "
+                f"bad_ori: {bo_val:.1%} | vel_err: {ve_val:.2f} m/s"
+            )
+
     def print_alert(self, state: RunState) -> None:
         """Multi-line alert output."""
         best_ckpt = f"model_{state.best_model_iter}.pt"
@@ -507,6 +537,10 @@ class ReportGenerator:
                 "action_rate": state.action_rates[-1][1] if state.action_rates else None,
                 "value_loss": state.value_losses[-1][1] if state.value_losses else None,
                 "entropy": state.entropies[-1][1] if state.entropies else None,
+                "episode_length": state.episode_lengths[-1][1] if state.episode_lengths else None,
+                "time_out": state.time_outs[-1][1] if state.time_outs else None,
+                "bad_orientation": state.bad_orientations[-1][1] if state.bad_orientations else None,
+                "vel_error": state.vel_errors[-1][1] if state.vel_errors else None,
             },
             "std_values": {str(k): v for k, v in sorted(state.std_values.items())},
         }
@@ -617,6 +651,10 @@ def analyze_run(run_dir: str, cfg: MonitorConfig, reporter: ReportGenerator) -> 
             state.action_rates = metrics.get(TAG_ACTION_RATE, [])
             state.value_losses = metrics.get(TAG_VALUE_LOSS, [])
             state.entropies = metrics.get(TAG_ENTROPY, [])
+            state.episode_lengths = metrics.get(TAG_EP_LEN, [])
+            state.time_outs = metrics.get(TAG_TIME_OUT, [])
+            state.bad_orientations = metrics.get(TAG_BAD_ORI, [])
+            state.vel_errors = metrics.get(TAG_VEL_ERR, [])
         except Exception as e:
             print(f"[WARN] Failed to parse TensorBoard events in {run_dir}: {e}")
     else:
@@ -685,6 +723,40 @@ def find_run_dirs(log_root: str) -> list[str]:
     return runs
 
 
+def find_active_run(log_root: str) -> Optional[str]:
+    """Find the currently active training run.
+
+    Strategy: find the run directory whose latest checkpoint or TensorBoard
+    event file has the most recent modification time.  Only considers runs
+    whose latest checkpoint was modified within the last 30 minutes.
+
+    Returns the run directory path, or None if no active run found.
+    """
+    root = Path(log_root)
+    if not root.is_dir():
+        return None
+
+    best_run: Optional[str] = None
+    best_mtime: float = 0.0
+    cutoff = time.time() - 1800  # 30 minutes ago
+
+    for run_dir in root.iterdir():
+        if not run_dir.is_dir() or run_dir.name.startswith("."):
+            continue
+        # Check modification time of the most recent checkpoint or event file
+        latest_mtime = 0.0
+        for pattern in ["model_*.pt", "events.out.tfevents.*"]:
+            for f in run_dir.glob(pattern):
+                mtime = f.stat().st_mtime
+                if mtime > latest_mtime:
+                    latest_mtime = mtime
+        if latest_mtime > cutoff and latest_mtime > best_mtime:
+            best_mtime = latest_mtime
+            best_run = str(run_dir)
+
+    return best_run
+
+
 def incremental_update(state: RunState, cfg: MonitorConfig) -> None:
     """Incrementally read new data since last check."""
     # -- New TensorBoard data ---------------------------------------------- #
@@ -699,6 +771,10 @@ def incremental_update(state: RunState, cfg: MonitorConfig) -> None:
             state.action_rates.extend(metrics.get(TAG_ACTION_RATE, []))
             state.value_losses.extend(metrics.get(TAG_VALUE_LOSS, []))
             state.entropies.extend(metrics.get(TAG_ENTROPY, []))
+            state.episode_lengths.extend(metrics.get(TAG_EP_LEN, []))
+            state.time_outs.extend(metrics.get(TAG_TIME_OUT, []))
+            state.bad_orientations.extend(metrics.get(TAG_BAD_ORI, []))
+            state.vel_errors.extend(metrics.get(TAG_VEL_ERR, []))
         except Exception as e:
             print(f"[WARN] TensorBoard parse error for {state.run_name}: {e}")
 
@@ -737,6 +813,141 @@ def incremental_update(state: RunState, cfg: MonitorConfig) -> None:
 
     tracker = BestModelTracker(window=10)
     tracker.update(state)
+
+
+def run_realtime(cfg: MonitorConfig) -> None:
+    """Realtime monitoring: focus on the single active training run.
+
+    Auto-detects which run is currently training (most recent checkpoint
+    modified within 30 minutes), then polls it every 30 seconds showing
+    compact live-updating status.  Exits automatically when training stops
+    (no new data for 3 consecutive polls).
+    """
+    poll_interval = min(cfg.poll_interval_sec, 30)  # cap at 30s for realtime
+    stale_threshold = 3  # exit after this many polls with no new data
+
+    # Auto-detect active run
+    active_dir = cfg.run_dir or find_active_run(cfg.log_root)
+    if not active_dir:
+        print("[REALTIME] No active training run detected.")
+        print("[REALTIME] Start training first, or use --run_dir to specify.")
+        sys.exit(1)
+
+    run_name = Path(active_dir).name
+    print(f"[REALTIME] Monitoring: {run_name}")
+    print(f"[REALTIME] Poll every {poll_interval}s, auto-exit after {stale_threshold} stale polls")
+    print(f"[REALTIME] Ctrl+C to stop")
+    print()
+
+    # Initialize state
+    state = RunState(run_name=run_name, run_dir=active_dir)
+    reporter = ReportGenerator(cfg)
+    detector = OverfittingDetector(cfg)
+    tracker = BestModelTracker(window=10)
+
+    # Initial full load
+    incremental_update(state, cfg)
+    prev_iter = state.last_checked_step
+    prev_time = time.time()
+
+    reporter.print_status(state)
+    print()
+
+    stale_count = 0
+
+    while True:
+        try:
+            time.sleep(poll_interval)
+
+            # Incremental read
+            incremental_update(state, cfg)
+
+            new_iter = state.last_checked_step
+            now = time.time()
+            elapsed = now - prev_time
+
+            # Detect new data
+            if new_iter > prev_iter:
+                stale_count = 0
+                iters_delta = new_iter - prev_iter
+                speed = iters_delta / elapsed if elapsed > 0 else 0
+                prev_iter = new_iter
+                prev_time = now
+            else:
+                stale_count += 1
+                speed = 0
+                iters_delta = 0
+
+            # Overfitting check
+            if not state.overfitting_detected:
+                reason = detector.check(state)
+                if reason:
+                    state.overfitting_detected = True
+                    state.overfitting_reason = reason
+                    reporter.print_alert(state)
+                    reporter.write_overfitting_marker(state)
+                    if cfg.auto_export:
+                        _auto_export_best(state, cfg)
+
+            # Compact realtime status
+            ts = datetime.now().strftime("%H:%M:%S")
+            latest_reward = state.rewards[-1][1] if state.rewards else 0
+            latest_ar = state.action_rates[-1][1] if state.action_rates else 0
+            latest_ent = state.entropies[-1][1] if state.entropies else 0
+            status = "OVERFITTING" if state.overfitting_detected else "HEALTHY"
+
+            # Trend arrow
+            if len(state.rewards) >= 2:
+                recent = [v for _, v in state.rewards[-5:]]
+                older = [v for _, v in state.rewards[-10:-5]] if len(state.rewards) >= 10 else recent
+                recent_avg = sum(recent) / len(recent)
+                older_avg = sum(older) / len(older)
+                if recent_avg > older_avg * 1.02:
+                    trend = "↑"
+                elif recent_avg < older_avg * 0.98:
+                    trend = "↓"
+                else:
+                    trend = "→"
+            else:
+                trend = "?"
+
+            speed_str = f"{speed:.0f} iter/s" if speed > 0 else "stale"
+
+            # Behavioral metrics for realtime
+            to_str = f"to:{state.time_outs[-1][1]:.0%}" if state.time_outs else ""
+            ep_str = f"ep:{state.episode_lengths[-1][1]:.0f}" if state.episode_lengths else ""
+            ve_str = f"ve:{state.vel_errors[-1][1]:.2f}" if state.vel_errors else ""
+            extra = " | ".join(filter(None, [to_str, ep_str, ve_str]))
+
+            print(
+                f"[{ts}] iter {new_iter:>6} | "
+                f"reward {latest_reward:>7.2f} {trend} | "
+                f"peak {state.peak_reward:.2f}@{state.peak_reward_iter} | "
+                f"best {state.best_model_reward:.2f}@{state.best_model_iter} | "
+                f"ar {latest_ar:.3f} | ent {latest_ent:.1f} | "
+                f"{speed_str} | {status}"
+            )
+            if extra:
+                print(f"  [BEHAVIOR] {extra}")
+
+            # Update report file
+            reporter.write_report(state)
+
+            # Auto-exit if training stopped
+            if stale_count >= stale_threshold:
+                print()
+                print(f"[REALTIME] No new data for {stale_threshold * poll_interval}s — training appears stopped.")
+                print(f"[REALTIME] Final: iter {new_iter}, reward {latest_reward:.2f}, best model_{state.best_model_iter}.pt ({state.best_model_reward:.2f})")
+                break
+
+        except KeyboardInterrupt:
+            print(f"\n[REALTIME] Stopped. Latest: iter {state.last_checked_step}")
+            break
+        except Exception as e:
+            print(f"[REALTIME] Error: {e}")
+            import traceback
+            traceback.print_exc()
+            time.sleep(poll_interval)
 
 
 def run_continuous(cfg: MonitorConfig) -> None:
@@ -849,6 +1060,10 @@ def parse_args():
         "--once", action="store_true",
         help="One-shot analysis mode (analyse existing run, then exit)",
     )
+    parser.add_argument(
+        "--realtime", action="store_true",
+        help="Realtime mode: auto-detect active run, compact live updates every 30s",
+    )
 
     # Paths
     parser.add_argument(
@@ -922,7 +1137,7 @@ def _write_best_models_json(results: list[RunState], cfg: MonitorConfig) -> None
         if not state.rewards or state.peak_reward == -float("inf"):
             continue
         # Extract short version name from run directory
-        # e.g. "2026-05-01_04-50-05_z1_locomotion_v4_gentle_terrain" -> "v4_gentle"
+        # e.g. "2026-05-01_04-50-05_z1_locomotion_s4_gentle_terrain" -> "s4_gentle"
         run_dir_name = Path(state.run_dir).name
         version = run_dir_name
         # Try to extract version identifier
@@ -953,6 +1168,10 @@ def _write_best_models_json(results: list[RunState], cfg: MonitorConfig) -> None
             "checkpoint_path": checkpoint_path,
             "latest_action_rate": state.action_rates[-1][1] if state.action_rates else None,
             "latest_std": list(state.std_values.values())[-1] if state.std_values else None,
+            "latest_time_out": state.time_outs[-1][1] if state.time_outs else None,
+            "latest_episode_length": state.episode_lengths[-1][1] if state.episode_lengths else None,
+            "latest_bad_orientation": state.bad_orientations[-1][1] if state.bad_orientations else None,
+            "latest_vel_error": state.vel_errors[-1][1] if state.vel_errors else None,
         })
 
     # Sort by best reward descending
@@ -998,11 +1217,15 @@ def main():
         rtx_host=args.rtx_host,
         local_tmp=args.local_tmp,
         once=args.once,
+        realtime=args.realtime,
     )
 
     reporter = ReportGenerator(cfg)
 
-    if cfg.once:
+    if cfg.realtime:
+        # -- Realtime mode ----------------------------------------------- #
+        run_realtime(cfg)
+    elif cfg.once:
         # -- One-shot mode ------------------------------------------------ #
         if cfg.run_dir:
             run_dirs = [cfg.run_dir]

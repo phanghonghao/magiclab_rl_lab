@@ -64,6 +64,12 @@ parser.add_argument("--clip_actions", type=float, default=None,
                          "Use 1.0 to compare with MuJoCo clip behavior.")
 parser.add_argument("--diag_interval", type=int, default=50,
                     help="Print diagnostic stats every N steps (raw action magnitudes, velocity, etc.)")
+parser.add_argument("--no_camera_track", action="store_true", default=False,
+                    help="Disable camera tracking (camera stays at default position)")
+parser.add_argument("--camera_distance", type=float, default=3.5,
+                    help="Camera distance from robot for tracking (default: 3.5)")
+parser.add_argument("--camera_height", type=float, default=1.5,
+                    help="Camera height above robot for tracking (default: 1.5)")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -134,21 +140,37 @@ def main():
         obs, info = env.reset()
         print(f"[INFO] Environment reset. Obs shape: {obs.shape if hasattr(obs, 'shape') else type(obs)}", flush=True)
 
-        # --- Camera tracking setup ---
+        # --- Camera tracking setup (works in both video and live play modes) ---
         cam_ctx = None
-        if args_cli.video:
+        cam_dist = args_cli.camera_distance
+        cam_height = args_cli.camera_height
+        if not args_cli.no_camera_track:
             try:
                 from isaaclab.sim import SimulationContext
                 cam_ctx = SimulationContext.instance()
                 robot_pos = env.unwrapped.scene["robot"].data.root_pos_w[0].cpu().numpy()
                 cam_ctx.set_camera_view(
-                    eye=[robot_pos[0] + 1.0, robot_pos[1] + 3.5, robot_pos[2] + 1.5],
+                    eye=[robot_pos[0] + 1.0, robot_pos[1] + cam_dist, robot_pos[2] + cam_height],
                     target=[robot_pos[0] + 0.5, robot_pos[1], robot_pos[2] + 0.5],
                 )
-                print(f"[INFO] Camera tracking enabled. Robot at ({robot_pos[0]:.1f}, {robot_pos[1]:.1f}, {robot_pos[2]:.1f})", flush=True)
+                print(f"[INFO] Camera tracking enabled (dist={cam_dist}, height={cam_height}). "
+                      f"Robot at ({robot_pos[0]:.1f}, {robot_pos[1]:.1f}, {robot_pos[2]:.1f})", flush=True)
             except Exception as e:
-                print(f"[WARN] Camera tracking setup failed: {e}. Video may not show robot.", flush=True)
+                print(f"[WARN] Camera tracking setup failed: {e}. Camera will stay at default position.", flush=True)
                 cam_ctx = None
+        else:
+            # Static angled view — shows all robots on the terrain
+            try:
+                from isaaclab.sim import SimulationContext
+                cam_ctx_static = SimulationContext.instance()
+                robot_pos = env.unwrapped.scene["robot"].data.root_pos_w[0].cpu().numpy()
+                cam_ctx_static.set_camera_view(
+                    eye=[robot_pos[0] + 12.0, robot_pos[1] + 12.0, robot_pos[2] + 15.0],
+                    target=[robot_pos[0], robot_pos[1], robot_pos[2]],
+                )
+                print(f"[INFO] Camera tracking disabled. Static angled view set (45° overhead).", flush=True)
+            except Exception as e:
+                print(f"[INFO] Camera tracking disabled. Static view setup failed: {e}.", flush=True)
 
         # --- Renderer warmup: skip initial black frames ---
         if args_cli.video:
@@ -162,7 +184,7 @@ def main():
                         try:
                             robot_pos = env.unwrapped.scene["robot"].data.root_pos_w[0].cpu().numpy()
                             cam_ctx.set_camera_view(
-                                eye=[robot_pos[0] + 1.0, robot_pos[1] + 3.5, robot_pos[2] + 1.5],
+                                eye=[robot_pos[0] + 1.0, robot_pos[1] + cam_dist, robot_pos[2] + cam_height],
                                 target=[robot_pos[0] + 0.5, robot_pos[1], robot_pos[2] + 0.5],
                             )
                         except Exception:
@@ -219,12 +241,12 @@ def main():
                 else:
                     actions = raw_actions
 
-                # Update camera to follow robot (env 0) during video recording
+                # Update camera to follow robot (env 0)
                 if cam_ctx is not None:
                     try:
                         robot_pos = env.unwrapped.scene["robot"].data.root_pos_w[0].cpu().numpy()
                         cam_ctx.set_camera_view(
-                            eye=[robot_pos[0] + 1.0, robot_pos[1] + 3.5, robot_pos[2] + 1.5],
+                            eye=[robot_pos[0] + 1.0, robot_pos[1] + cam_dist, robot_pos[2] + cam_height],
                             target=[robot_pos[0] + 0.5, robot_pos[1], robot_pos[2] + 0.5],
                         )
                     except Exception:
