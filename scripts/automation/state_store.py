@@ -21,7 +21,7 @@ class OrchestratorState:
     """Serializable snapshot of the orchestrator's progress."""
 
     plan_name: str = ""
-    current_stage_id: str = ""          # e.g. "s4_rough_l1"
+    current_stage_id: str = ""          # e.g. "s4_rough_l1" (now = sub_phase id)
     current_stage_status: str = "pending"  # pending / running / overfitting / complete / failed
     training_pid: Optional[int] = None
     training_run_dir: Optional[str] = None
@@ -31,6 +31,12 @@ class OrchestratorState:
     retry_count: int = 0
     started_at: str = ""
     updated_at: str = ""
+
+    # Phase-based fields (new)
+    current_phase_id: str = ""          # e.g. "p1"
+    starting_reward: Optional[float] = None  # reward at start of sub-phase (for rollback)
+    rollback_count: int = 0             # per sub-phase rollback counter
+    phase_history: list[dict] = field(default_factory=list)  # completed phase results
 
     def touch(self) -> None:
         """Refresh ``updated_at`` timestamp."""

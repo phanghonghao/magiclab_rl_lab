@@ -32,6 +32,10 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
     arg_group.add_argument("--checkpoint", type=str, default=None, help="Checkpoint file to resume from.")
     # -- logger arguments
     arg_group.add_argument(
+        "--agent_cfg", type=str, default=None,
+        help="Path to a Python file containing an agent config class to override the default PPO config.",
+    )
+    arg_group.add_argument(
         "--logger", type=str, default=None, choices={"wandb", "tensorboard", "neptune"}, help="Logger module to use."
     )
     arg_group.add_argument(

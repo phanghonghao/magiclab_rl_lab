@@ -48,6 +48,7 @@ class TrainingLauncher:
         num_gpus: int = 1,
         master_port: int = 29502,
         extra_args: Optional[list[str]] = None,
+        agent_cfg: Optional[str] = None,
     ) -> subprocess.Popen:
         """Start training as a subprocess and return the :class:`Popen`.
 
@@ -59,12 +60,12 @@ class TrainingLauncher:
         if num_gpus > 1:
             cmd = self._build_multigpu_cmd(
                 run_name, max_iterations, num_envs, device, task,
-                checkpoint, num_gpus, master_port, extra_args,
+                checkpoint, num_gpus, master_port, extra_args, agent_cfg,
             )
         else:
             cmd = self._build_single_cmd(
                 run_name, max_iterations, num_envs, device, task,
-                checkpoint, extra_args,
+                checkpoint, extra_args, agent_cfg,
             )
 
         logger.info("Launching training: %s", " ".join(cmd))
@@ -82,7 +83,7 @@ class TrainingLauncher:
         return proc
 
     def _build_single_cmd(self, run_name, max_iterations, num_envs, device,
-                          task, checkpoint, extra_args):
+                          task, checkpoint, extra_args, agent_cfg=None):
         cmd = [
             self._python, "-u",
             self._train_script,
@@ -95,12 +96,15 @@ class TrainingLauncher:
         ]
         if checkpoint:
             cmd += ["--checkpoint", str(checkpoint)]
+        if agent_cfg:
+            cmd += ["--agent_cfg", str(agent_cfg)]
         if extra_args:
             cmd.extend(extra_args)
         return cmd
 
     def _build_multigpu_cmd(self, run_name, max_iterations, num_envs, device,
-                            task, checkpoint, num_gpus, master_port, extra_args):
+                            task, checkpoint, num_gpus, master_port, extra_args,
+                            agent_cfg=None):
         # Extract starting GPU index from device string
         gpu_start = 0
         if device.startswith("cuda:"):
@@ -131,6 +135,8 @@ class TrainingLauncher:
                 f"--load_run={run_dir.name}",
                 f"--checkpoint={ckpt_name}",
             ]
+        if agent_cfg:
+            cmd += [f"--agent_cfg={agent_cfg}"]
         if extra_args:
             cmd.extend(extra_args)
         return cmd

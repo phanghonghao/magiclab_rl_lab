@@ -29,7 +29,11 @@ Usage:
 
 import argparse
 import math
+import os
 import time
+
+# MUST set before importing mujoco for EGL offscreen rendering
+os.environ.setdefault("MUJOCO_GL", "egl")
 
 import numpy as np
 import yaml
@@ -46,6 +50,7 @@ def parse_args():
     parser.add_argument("--vel_yaw", type=float, default=0.0, help="Yaw velocity command (rad/s)")
     parser.add_argument("--keyboard", action="store_true", help="Use keyboard for velocity commands")
     parser.add_argument("--num_steps", type=int, default=10000, help="Number of control steps")
+    parser.add_argument("--record", type=str, default=None, help="Record video to this path (EGL offscreen)")
     parser.add_argument("--show_viewer", action="store_true", default=True, help="Show MuJoCo viewer")
     return parser.parse_args()
 
@@ -67,15 +72,18 @@ LEG_ACTUATOR_NAMES = [
     "right_knee_actuator", "right_ankle_pitch_actuator", "right_ankle_roll_actuator",
 ]
 
-# Default PD gains (matching training config in magiclab.py)
+# Default PD gains
+# Kp matches training config in magiclab.py exactly
 DEFAULT_KP = np.array([
     100, 100, 100, 150, 60, 60,   # left: hip_pitch, hip_roll, hip_yaw, knee, ankle_pitch, ankle_roll
     100, 100, 100, 150, 60, 60,   # right
 ], dtype=np.float64)
 
+# Kd boosted ~30% vs training values to compensate for implicit PD's built-in
+# numerical damping that explicit PD lacks (Isaac Lab IdealPDActuator is implicit)
 DEFAULT_KD = np.array([
-    4, 4, 4, 5, 3, 3,
-    4, 4, 4, 5, 3, 3,
+    5.2, 5.2, 5.2, 6.5, 3.9, 3.9,
+    5.2, 5.2, 5.2, 6.5, 3.9, 3.9,
 ], dtype=np.float64)
 
 # Default joint positions (matching init_state in magiclab.py)
@@ -98,6 +106,17 @@ GAIT_PERIOD = 0.6
 PHYSICS_DT = 0.002
 DECIMATION = 10
 CONTROL_DT = PHYSICS_DT * DECIMATION  # 0.02s = 50Hz
+
+# Contact parameters calibrated for PhysX match
+# Friction: use middle of training randomization range (0.3–1.0)
+CONTACT_FOOT_FRICTION = (0.65, 0.02, 0.02)     # (slide, torsion, rolling)
+CONTACT_GROUND_FRICTION = (0.65, 0.02, 0.02)
+# solref: stiffer than MJCF default (-500 -800) to approximate PhysX rigid contact
+CONTACT_FOOT_SOLREF = (-3000, -300)
+CONTACT_GROUND_SOLREF = (-3000, -300)
+# solimp: higher dmin/dmax = stiffer constraint at contact
+CONTACT_FOOT_SOLIMP = (0.9, 0.99, 0.001, 0.5, 2)
+CONTACT_GROUND_SOLIMP = (0.9, 0.99, 0.001, 0.5, 2)
 
 # Observation dimensions per frame: ang_vel(3) + gravity(3) + cmd(3) + joint_pos(12) + joint_vel(12) + last_action(12) + gait(2)
 OBS_DIM_PER_FRAME = 47
@@ -316,6 +335,18 @@ class MuJoCoDeploy:
         for i, jid in enumerate(self.leg_joint_ids):
             self.model.dof_armature[jid] = armature[i]
 
+        # Apply contact parameters calibrated for PhysX match
+        for geom_id in range(self.model.ngeom):
+            name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
+            if name in ("l_foot", "r_foot"):
+                self.model.geom_friction[geom_id] = CONTACT_FOOT_FRICTION
+                self.model.geom_solref[geom_id] = CONTACT_FOOT_SOLREF
+                self.model.geom_solimp[geom_id] = CONTACT_FOOT_SOLIMP
+            elif name == "ground":
+                self.model.geom_friction[geom_id] = CONTACT_GROUND_FRICTION
+                self.model.geom_solref[geom_id] = CONTACT_GROUND_SOLREF
+                self.model.geom_solimp[geom_id] = CONTACT_GROUND_SOLIMP
+
         # Effort limits matching training config
         self.effort_limits = np.array([120, 120, 120, 120, 50, 50,
                                        120, 120, 120, 120, 50, 50], dtype=np.float64)
@@ -355,12 +386,12 @@ class MuJoCoDeploy:
         for _ in range(HISTORY_LENGTH):
             # Hold default pose for warm-up steps
             tgt = self.default_joint_pos
-            cp = np.array([self.data.qpos[a] for a in self.leg_qpos_addr])
-            cv = np.array([self.data.qvel[a] for a in self.leg_dof_addr])
-            torques = np.clip(self.kp * (tgt - cp) - self.kd * cv, -self.effort_limits, self.effort_limits)
-            for i, act_id in enumerate(self.leg_actuator_ids):
-                self.data.ctrl[act_id] = torques[i]
             for _ in range(DECIMATION):
+                cp = np.array([self.data.qpos[a] for a in self.leg_qpos_addr])
+                cv = np.array([self.data.qvel[a] for a in self.leg_dof_addr])
+                torques = np.clip(self.kp * (tgt - cp) - self.kd * cv, -self.effort_limits, self.effort_limits)
+                for i, act_id in enumerate(self.leg_actuator_ids):
+                    self.data.ctrl[act_id] = torques[i]
                 mujoco.mj_step(self.model, self.data)
             self.sim_time += CONTROL_DT
 
@@ -426,23 +457,19 @@ class MuJoCoDeploy:
         # Compute target joint positions: target = offset + action * scale
         target_pos = self.action_offset + action * self.action_scale
 
-        # Get current joint state
-        current_pos = np.array([self.data.qpos[a] for a in self.leg_qpos_addr])
-        current_vel = np.array([self.data.qvel[a] for a in self.leg_dof_addr])
-
-        # PD control: torque = kp * (target - pos) - kd * vel (with effort limits)
-        torques = np.clip(
-            self.kp * (target_pos - current_pos) - self.kd * current_vel,
-            -self.effort_limits, self.effort_limits
-        )
-
-        # Apply torques via actuators
-        for i, act_id in enumerate(self.leg_actuator_ids):
-            self.data.ctrl[act_id] = torques[i]
-
-        # Step physics (decimation=10)
+        # Step physics with PD recomputed at every sub-step
+        # Isaac Lab implicit PD effectively updates every physics step,
+        # so recomputing explicit PD each sub-step narrows the sim2sim gap.
         import mujoco
         for _ in range(DECIMATION):
+            current_pos = np.array([self.data.qpos[a] for a in self.leg_qpos_addr])
+            current_vel = np.array([self.data.qvel[a] for a in self.leg_dof_addr])
+            torques = np.clip(
+                self.kp * (target_pos - current_pos) - self.kd * current_vel,
+                -self.effort_limits, self.effort_limits
+            )
+            for i, act_id in enumerate(self.leg_actuator_ids):
+                self.data.ctrl[act_id] = torques[i]
             mujoco.mj_step(self.model, self.data)
 
         self.sim_time += CONTROL_DT
@@ -493,12 +520,23 @@ def main():
     print(f"[INFO] Observation: {OBS_DIM_TOTAL}d ({OBS_DIM_PER_FRAME}d x {HISTORY_LENGTH} frames)")
     print(f"[INFO] Velocity command: {vel_cmd}")
 
-    # Launch viewer
+    # Launch viewer or renderer
+    import mujoco
     viewer = None
-    if args.show_viewer:
+    renderer = None
+    frames = []
+
+    if args.record:
+        renderer = mujoco.Renderer(env.model, height=480, width=640)
+        cam = mujoco.MjvCamera()
+        mujoco.mjv_defaultFreeCamera(env.model, cam)
+        cam.distance = 3.0
+        cam.elevation = -20
+        cam.azimuth = 90
+        print(f"[INFO] EGL offscreen recording -> {args.record}")
+        args.show_viewer = False
+    elif args.show_viewer:
         try:
-            import mujoco
-            # MuJoCo >= 3.0 passive viewer
             viewer = mujoco.viewer.launch_passive(env.model, env.data)
             print("[INFO] Viewer launched (close window to end)")
         except Exception:
@@ -506,6 +544,7 @@ def main():
             viewer = None
 
     # Main loop
+    fall_count = 0
     print(f"[INFO] Running {args.num_steps} steps...")
     try:
         for step in range(args.num_steps):
@@ -519,8 +558,12 @@ def main():
             fell = env.step()
             if fell:
                 env.reset()
-                state = env.get_robot_state()
-                print(f"  Step {step:5d} | FALL DETECTED — reset")
+                fall_count += 1
+
+            # Record frame
+            if renderer:
+                renderer.update_scene(env.data, camera=cam)
+                frames.append(renderer.render().copy())
 
             # Sync viewer
             if viewer is not None:
@@ -534,13 +577,22 @@ def main():
                 state = env.get_robot_state()
                 print(f"  Step {step:5d} | t={state['time']:.1f}s | "
                       f"pos=({state['x']:.2f}, {state['y']:.2f}, {state['z']:.2f}) | "
-                      f"cmd=({env.vel_cmd[0]:.2f}, {env.vel_cmd[1]:.2f}, {env.vel_cmd[2]:.2f})")
+                      f"falls={fall_count}")
 
-            # Sleep for real-time
-            time.sleep(max(0, CONTROL_DT - 0.001))
+            # Sleep for real-time (only in viewer mode)
+            if viewer and not args.record:
+                time.sleep(max(0, CONTROL_DT - 0.001))
 
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted by user")
+
+    # Save video
+    if args.record and frames:
+        import imageio
+        print(f"[INFO] Saving {len(frames)} frames to {args.record}...")
+        imageio.mimwrite(args.record, frames, fps=int(1.0 / CONTROL_DT))
+        sz = os.path.getsize(args.record) / (1024 * 1024)
+        print(f"[INFO] Done! {args.record} ({sz:.1f} MB), Falls: {fall_count}")
 
     if viewer is not None:
         try:

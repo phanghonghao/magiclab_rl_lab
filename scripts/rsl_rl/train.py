@@ -117,9 +117,40 @@ torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
 
+def _load_agent_cfg(cfg_path: str) -> RslRlOnPolicyRunnerCfg:
+    """Dynamically load a PPO config class from an external Python file.
+
+    The file must define a class that inherits from ``RslRlOnPolicyRunnerCfg``.
+    The first such class found is used.
+    """
+    import importlib.util
+
+    mod_name = "_agent_cfg_module"
+    spec = importlib.util.spec_from_file_location(mod_name, cfg_path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = mod  # Register so dataclass @configclass can find it
+    spec.loader.exec_module(mod)
+
+    # Find the first RslRlOnPolicyRunnerCfg subclass in the module
+    for attr_name in dir(mod):
+        attr = getattr(mod, attr_name)
+        if (
+            isinstance(attr, type)
+            and issubclass(attr, RslRlOnPolicyRunnerCfg)
+            and attr is not RslRlOnPolicyRunnerCfg
+        ):
+            print(f"[INFO] Loaded agent config: {attr_name} from {cfg_path}")
+            return attr()
+
+    raise ValueError(f"No RslRlOnPolicyRunnerCfg subclass found in {cfg_path}")
+
+
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Train with RSL-RL agent."""
+    # If --agent_cfg is specified, load the alternative config class
+    if args_cli.agent_cfg is not None:
+        agent_cfg = _load_agent_cfg(args_cli.agent_cfg)
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs

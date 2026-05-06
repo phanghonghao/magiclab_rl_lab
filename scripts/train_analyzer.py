@@ -270,6 +270,17 @@ def classify_failure(
             evidence=f"bad_ori={bad_ori_pct:.0f}%, vel_err={vel_err:.2f}, terrain={terrain}",
         ))
 
+    # --- HIGH_FALL_RATE (CRITICAL) ---
+    # bad_ori > 80%, reward >= 0, time_out < 50%
+    # Robot keeps falling but hasn't fully collapsed (reward still positive)
+    if bad_ori_pct > 80 and reward_latest >= 0 and time_out_pct < 50:
+        failures.append(FailureMode(
+            mode_id="HIGH_FALL_RATE",
+            name="高频摔倒",
+            severity="CRITICAL",
+            evidence=f"bad_ori={bad_ori_pct:.0f}%, reward={reward_latest:.2f}, time_out={time_out_pct:.0f}%, ep_len={ep_len:.0f}",
+        ))
+
     # --- POLICY_UNSTABLE (HIGH) ---
     # bad_ori 30-60% or time_out < 70%, indicating policy hasn't converged well
     if 20 < bad_ori_pct <= 60 or (time_out_pct < 70 and bad_ori_pct > 15):
@@ -287,7 +298,7 @@ def classify_failure(
             (state.peak_reward - reward_latest) / abs(state.peak_reward) * 100
             if state.peak_reward != 0 else 0
         )
-        if decline_from_peak > 15 and bad_ori_pct < 30:
+        if decline_from_peak > 20 and bad_ori_pct < 30:
             failures.append(FailureMode(
                 mode_id="REWARD_DECLINE",
                 name="奖励渐退",
@@ -611,6 +622,57 @@ def generate_recommendations(
         ))
         priority += 1
 
+    if "HIGH_FALL_RATE" in failure_ids:
+        recs.append(Recommendation(
+            priority=priority,
+            action="increase_orientation_penalty",
+            parameter="flat_orientation_weight",
+            current="-5.0",
+            suggested="-10.0 ~ -15.0",
+            reason="机器人持续摔倒但奖励为正，需大幅增加姿态惩罚使站立成为优先目标",
+        ))
+        priority += 1
+
+        recs.append(Recommendation(
+            priority=priority,
+            action="increase_height_penalty",
+            parameter="base_height_weight",
+            current="-10.0",
+            suggested="-15.0 ~ -20.0",
+            reason="增大高度惩罚防止机器人趴下，保持站立姿态",
+        ))
+        priority += 1
+
+        recs.append(Recommendation(
+            priority=priority,
+            action="tighten_bad_ori_threshold",
+            parameter="bad_orientation_limit_angle",
+            current="0.8",
+            suggested="0.5",
+            reason="降低bad_orientation触发阈值，让惩罚更早介入防止摔倒",
+        ))
+        priority += 1
+
+        recs.append(Recommendation(
+            priority=priority,
+            action="resume_from_good_checkpoint",
+            parameter="checkpoint",
+            current="current",
+            suggested="从已知良好checkpoint恢复",
+            reason="策略已偏离稳定区域，建议从之前表现好的checkpoint恢复训练",
+        ))
+        priority += 1
+
+        recs.append(Recommendation(
+            priority=priority,
+            action="reduce_curriculum_speed",
+            parameter="general",
+            current="N/A",
+            suggested="降低课程学习推进速度",
+            reason="训练推进过快导致策略来不及适应，应放缓课程进度",
+        ))
+        priority += 1
+
     # If no specific failure mode matched but overfitting was detected
     if not failure_ids and state.overfitting_detected:
         recs.append(Recommendation(
@@ -791,6 +853,11 @@ def analyze_run(
         }
 
     # -- Step 2: Failure classification -- #
+    # Skip runs with no meaningful data
+    if not state.rewards or len(state.rewards) < 3:
+        if not json_output:
+            print(f"[SKIP] Insufficient data in {run_name} ({len(state.rewards)} points)")
+        return {"run_name": run_name, "overall_status": "SKIP", "skip_reason": "no_data"}
     failures = classify_failure(state, trends, terrain)
 
     # Determine overall severity
@@ -1026,8 +1093,8 @@ def main():
             except Exception as e:
                 print(f"[WARN] Failed to analyze {rd}: {e}", file=sys.stderr)
 
-        # Filter to only failed/overfitted runs if --all
-        failed = [r for r in results if r["failure_modes"]]
+        # Filter to only failed/overfitted runs (skip empty ones)
+        failed = [r for r in results if r.get("overall_status") != "SKIP" and r["failure_modes"]]
         if not failed:
             if args.json:
                 print(json.dumps({"status": "all_healthy", "total_runs": len(results)}, indent=2))

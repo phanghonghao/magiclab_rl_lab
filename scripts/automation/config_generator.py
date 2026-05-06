@@ -1,0 +1,428 @@
+"""Generate velocity_env_cfg.py from a parameter dict.
+
+Reads the merged phase/sub-phase parameters and produces a complete
+Python config file that Isaac Lab can import at runtime.  Uses the
+original velocity_env_cfg.py as a base template and replaces only the
+dynamic sections (terrain, commands, rewards, terminations, sim params).
+
+This avoids f-string brace conflicts with Isaac Lab's ``{ENV_REGEX_NS}``
+and other placeholder syntax.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from pathlib import Path
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+# Path to the active config that Isaac Lab reads
+_ACTIVE_CFG_REL = (
+    "source/magiclab_rl_lab/magiclab_rl_lab/tasks/locomotion"
+    "/robots/z1/12dof/velocity_env_cfg.py"
+)
+
+# Path to the original template config (used as base)
+_TEMPLATE_CFG_REL = _ACTIVE_CFG_REL
+
+
+# ── Terrain generator builder ──────────────────────────────────── #
+
+
+def _build_terrain_generator_block(terrain_cfg: Optional[dict]) -> str:
+    """Return Python source for the COBBLESTONE_ROAD_CFG variable."""
+    if terrain_cfg is None:
+        return "COBBLESTONE_ROAD_CFG = None"
+
+    lines = [
+        "COBBLESTONE_ROAD_CFG = terrain_gen.TerrainGeneratorCfg(",
+    ]
+    for key in ("size", "border_width", "num_rows", "num_cols",
+                "horizontal_scale", "vertical_scale", "slope_threshold"):
+        if key in terrain_cfg:
+            val = terrain_cfg[key]
+            lines.append(f"    {key}={val!r},")
+    if "difficulty_range" in terrain_cfg:
+        lines.append(f"    difficulty_range={terrain_cfg['difficulty_range']!r},")
+    lines.append("    use_cache=False,")
+    subs = terrain_cfg.get("sub_terrains", {})
+    if subs:
+        lines.append("    sub_terrains={")
+        _type_map = {
+            "MeshPlaneTerrainCfg": "terrain_gen.MeshPlaneTerrainCfg",
+            "RandomGridTerrainCfg": "terrain_gen.RandomGridTerrainCfg",
+            "StairsTerrainCfg": "terrain_gen.StairsTerrainCfg",
+            "GapTerrainCfg": "terrain_gen.GapTerrainCfg",
+            "BoxesTerrainCfg": "terrain_gen.BoxesTerrainCfg",
+        }
+        for name, scfg in subs.items():
+            cls_name = _type_map.get(scfg.get("type", ""), "terrain_gen.MeshPlaneTerrainCfg")
+            parts = [f'proportion={scfg.get("proportion", 0.5)}']
+            if "difficulty_range" in scfg:
+                parts.append(f'difficulty_range={scfg["difficulty_range"]!r}')
+            lines.append(f'        "{name}": {cls_name}({", ".join(parts)}),')
+        lines.append("    },")
+    lines.append(")")
+    return "\n".join(lines)
+
+
+# ── Terrain scene block builder ────────────────────────────────── #
+
+
+def _build_terrain_scene_block(terrain_type: str) -> str:
+    """Return the `terrain = TerrainImporterCfg(...)` block."""
+    if terrain_type == "plane":
+        return '''    terrain = TerrainImporterCfg(
+        prim_path="/World/ground",
+        terrain_type="plane",
+        terrain_generator=None,
+        collision_group=-1,
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            friction_combine_mode="multiply",
+            restitution_combine_mode="multiply",
+            static_friction=1.0,
+            dynamic_friction=1.0,
+        ),
+        debug_vis=False,
+    )'''
+    else:
+        return '''    terrain = TerrainImporterCfg(
+        prim_path="/World/ground",
+        terrain_type="generator",
+        terrain_generator=COBBLESTONE_ROAD_CFG,
+        max_init_terrain_level=COBBLESTONE_ROAD_CFG.num_rows - 1,
+        collision_group=-1,
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            friction_combine_mode="multiply",
+            restitution_combine_mode="multiply",
+            static_friction=1.0,
+            dynamic_friction=1.0,
+        ),
+        visual_material=sim_utils.MdlFileCfg(
+            mdl_path=f"{ISAACLAB_NUCLEUS_DIR}/Materials/TilesMarbleSpiderWhiteBrickBondHoned/TilesMarbleSpiderWhiteBrickBondHoned.mdl",
+            project_uvw=True,
+            texture_scale=(0.25, 0.25),
+        ),
+        debug_vis=False,
+    )'''
+
+
+# ── Reward block builder ───────────────────────────────────────── #
+
+# Map reward key → (func_name, params_string_or_None)
+_REWARD_DEFS = {
+    "track_lin_vel_xy": (
+        "mdp.track_lin_vel_xy_yaw_frame_exp",
+        '"command_name": "base_velocity", "std": math.sqrt(0.25)',
+    ),
+    "track_ang_vel_z": (
+        "mdp.track_ang_vel_z_exp",
+        '"command_name": "base_velocity", "std": math.sqrt(0.25)',
+    ),
+    "alive": ("mdp.is_alive", None),
+    "base_linear_velocity": ("mdp.lin_vel_z_l2", None),
+    "base_angular_velocity": ("mdp.ang_vel_xy_l2", None),
+    "joint_vel": ("mdp.joint_vel_l2", None),
+    "joint_acc": ("mdp.joint_acc_l2", None),
+    "action_rate_l1": ("mdp.action_rate_l1", None),
+    "dof_pos_limits": ("mdp.joint_pos_limits", None),
+    "energy": ("mdp.energy", None),
+    "joint_deviation_legs": (
+        "mdp.joint_deviation_l1",
+        '"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_roll_joint", ".*_hip_yaw_joint"])',
+    ),
+    "flat_orientation_l2": ("mdp.flat_orientation_l2", None),
+    "base_height": (
+        "mdp.base_height_l2",
+        '"target_height": 0.7',
+    ),
+    "stand_still": (
+        "mdp.stand_still_joint_deviation_l1",
+        '"asset_cfg": SceneEntityCfg("robot", joint_names=".*"), '
+        '"command_name": "base_velocity", "command_threshold": 0.05',
+    ),
+    "feet_contact_number": (
+        "mdp.feet_contact_number",
+        '"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"), "period": 0.6',
+    ),
+    "feet_slide": (
+        "mdp.feet_slide",
+        '"asset_cfg": SceneEntityCfg("robot", body_names=".*ankle_roll.*"), '
+        '"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*")',
+    ),
+    "feet_clearance": (
+        "mdp.foot_clearance_reward",
+        '"std": 0.05, "tanh_mult": 2.0, "target_height": 0.1, '
+        '"asset_cfg": SceneEntityCfg("robot", body_names=".*ankle_roll.*")',
+    ),
+    "undesired_contacts": (
+        "mdp.undesired_contacts",
+        '"threshold": 1, "sensor_cfg": SceneEntityCfg("contact_forces", '
+        'body_names=["(?!.*ankle.*).*"])',
+    ),
+}
+
+
+def _build_reward_term(name: str, weight: float) -> str:
+    """Return a single RewTerm(...) source line."""
+    if name not in _REWARD_DEFS:
+        logger.warning("Unknown reward key '%s' — skipping", name)
+        return ""
+
+    func, params = _REWARD_DEFS[name]
+    try:
+        weight_val = float(weight)
+    except (TypeError, ValueError):
+        return ""
+    # Always generate the term even with zero weight — Isaac Lab curriculum
+    # may reference reward terms that need to exist regardless of weight.
+
+    if params:
+        return f'    {name} = RewTerm(func={func}, weight={weight_val}, params={{{params}}})'
+    else:
+        return f'    {name} = RewTerm(func={func}, weight={weight_val})'
+
+
+def _build_rewards_block(rewards: dict) -> str:
+    """Build the full RewardsCfg class body."""
+    lines = ['@configclass\nclass RewardsCfg:\n    """Reward terms for the MDP."""\n']
+    lines.append('    # -- task')
+    for rname, weight in rewards.items():
+        line = _build_reward_term(rname, weight)
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+# ── Commands block builder ─────────────────────────────────────── #
+
+
+def _build_commands_block(commands_cfg: dict) -> str:
+    """Return source for CommandsCfg class."""
+    ranges = commands_cfg.get("ranges", {})
+    limit_ranges = commands_cfg.get("limit_ranges", ranges)
+
+    def _fmt_range(r: dict, keys: list) -> str:
+        parts = []
+        for k in keys:
+            v = r.get(k, (0.0, 0.0))
+            parts.append(f"{k}={v!r}")
+        return ", ".join(parts)
+
+    range_keys = ["lin_vel_x", "lin_vel_y", "ang_vel_z"]
+    # Use string concatenation — no f-string for the whole block
+    return (
+        '@configclass\n'
+        'class CommandsCfg:\n'
+        '    """Command specifications for the MDP."""\n'
+        '\n'
+        '    base_velocity = mdp.UniformLevelVelocityCommandCfg(\n'
+        '        asset_name="robot",\n'
+        '        resampling_time_range=(10.0, 10.0),\n'
+        '        rel_standing_envs=0.02,\n'
+        '        rel_heading_envs=1.0,\n'
+        '        heading_command=False,\n'
+        '        debug_vis=True,\n'
+        '        ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(\n'
+        '            ' + _fmt_range(ranges, range_keys) + '\n'
+        '        ),\n'
+        '        limit_ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(\n'
+        '            ' + _fmt_range(limit_ranges, range_keys) + '\n'
+        '        ),\n'
+        '    )'
+    )
+
+
+# ── Full config generator ──────────────────────────────────────── #
+
+
+def generate_env_config(
+    params: dict[str, Any],
+    output_path: str | Path,
+    project_root: Optional[str | Path] = None,
+) -> Path:
+    """Generate a complete velocity_env_cfg.py and write it to *output_path*.
+
+    Uses the original velocity_env_cfg.py as a base template and replaces
+    only the dynamic sections via regex substitution.
+
+    Parameters
+    ----------
+    params : dict
+        Merged parameters from phase_manager (defaults → phase → sub_phase).
+        Expected top-level keys: ``env``, ``rewards``.
+    output_path : str or Path
+        Where to write the generated Python file.
+    project_root : str or Path, optional
+        Root of the magiclab_rl_lab project (to find the template).
+        If None, attempts to auto-detect.
+
+    Returns
+    -------
+    Path
+        The absolute path of the generated file.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Locate the template config
+    if project_root is not None:
+        template_path = Path(project_root) / _TEMPLATE_CFG_REL
+    else:
+        # Try relative to this file
+        template_path = Path(__file__).resolve().parent.parent.parent / _TEMPLATE_CFG_REL
+
+    if not template_path.exists():
+        raise FileNotFoundError(f"Template config not found: {template_path}")
+
+    # Use .orig backup to always read from the pristine template.
+    # The active config gets overwritten by _swap_active_config on every
+    # sub-phase, so without a backup the regex replacements would operate on
+    # an already-modified file and could corrupt the structure (e.g. eat
+    # RobotSceneCfg on the second sub-phase).
+    orig_path = template_path.parent / (template_path.name + ".orig")
+    if orig_path.exists():
+        read_path = orig_path
+    else:
+        # First call: snapshot the current (original) template
+        import shutil
+        shutil.copy2(str(template_path), str(orig_path))
+        read_path = template_path
+
+    template = read_path.read_text(encoding="utf-8")
+
+    env = params.get("env", {})
+    rewards = params.get("rewards", {})
+    commands = env.get("commands", {
+        "ranges": {"lin_vel_x": [-0.5, 1.0], "lin_vel_y": [-0.5, 0.5], "ang_vel_z": [-0.5, 0.5]},
+        "limit_ranges": {"lin_vel_x": [-0.5, 1.0], "lin_vel_y": [-0.5, 0.5], "ang_vel_z": [-0.5, 0.5]},
+    })
+
+    terrain_type = env.get("terrain_type", "plane")
+    terrain_generator = env.get("terrain_generator", None)
+    bad_orientation = env.get("bad_orientation_limit", 0.8)
+    base_height_min = env.get("base_height_minimum", 0.2)
+    decimation = env.get("decimation", 10)
+    episode_length_s = env.get("episode_length_s", 20.0)
+    sim_dt = env.get("sim_dt", 0.002)
+    action_scale = env.get("action_scale", 0.25)
+    curriculum_enabled = "True" if terrain_type == "generator" else "False"
+
+    # ── Replacement 1: Terrain generator (COBBLESTONE_ROAD_CFG) ── #
+    terrain_gen_block = _build_terrain_generator_block(terrain_generator)
+    template = re.sub(
+        r'^COBBLESTONE_ROAD_CFG = .*?^(\n)',
+        terrain_gen_block + r'\1',
+        template,
+        count=1,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+
+    # ── Replacement 2: Terrain scene block ── #
+    terrain_scene_block = _build_terrain_scene_block(terrain_type)
+    # Match from `terrain = TerrainImporterCfg(` to the closing `)`
+    template = re.sub(
+        r'    terrain = TerrainImporterCfg\(.*?\n    \)',
+        terrain_scene_block,
+        template,
+        count=1,
+        flags=re.DOTALL,
+    )
+
+    # ── Replacement 3: CommandsCfg ── #
+    commands_block = _build_commands_block(commands)
+    template = re.sub(
+        r'@configclass\nclass CommandsCfg:.*?(?=\n\n@configclass\nclass ActionsCfg)',
+        commands_block + '\n',
+        template,
+        count=1,
+        flags=re.DOTALL,
+    )
+
+    # ── Replacement 4: RewardsCfg ── #
+    rewards_block = _build_rewards_block(rewards)
+    template = re.sub(
+        r'@configclass\nclass RewardsCfg:.*?(?=\n\n@configclass\nclass TerminationsCfg)',
+        rewards_block + '\n',
+        template,
+        count=1,
+        flags=re.DOTALL,
+    )
+
+    # ── Replacement 5: TerminationsCfg params ── #
+    template = re.sub(
+        r'params=\{"minimum_height": [\d.]+\}',
+        f'params={{"minimum_height": {base_height_min}}}',
+        template,
+    )
+    template = re.sub(
+        r'params=\{"limit_angle": [\d.]+\}',
+        f'params={{"limit_angle": {bad_orientation}}}',
+        template,
+    )
+
+    # ── Replacement 6: Action scale ── #
+    template = re.sub(
+        r'scale=[\d.]+, use_default_offset=True',
+        f'scale={action_scale}, use_default_offset=True',
+        template,
+    )
+
+    # ── Replacement 7: Sim params in __post_init__ ── #
+    template = re.sub(
+        r'self\.decimation = \d+',
+        f'self.decimation = {decimation}',
+        template,
+    )
+    template = re.sub(
+        r'self\.episode_length_s = [\d.]+',
+        f'self.episode_length_s = {episode_length_s}',
+        template,
+    )
+    template = re.sub(
+        r'self\.sim\.dt = [\d.]+',
+        f'self.sim.dt = {sim_dt}',
+        template,
+    )
+
+    # ── Replacement 8: CurriculumCfg + __post_init__ curriculum block ── #
+    if terrain_type == "plane":
+        # No terrain generator → remove terrain_levels curriculum term
+        template = re.sub(
+            r'    terrain_levels = CurrTerm\(func=mdp\.terrain_levels_vel\)\n',
+            '',
+            template,
+        )
+        # Replace the curriculum block in __post_init__ with a simple pass
+        # Original has 2 if-blocks checking terrain_levels and setting curriculum
+        old_curr_block = (
+            r'        # check if terrain levels curriculum is enabled.*?'
+            r'self\.scene\.terrain\.terrain_generator\.curriculum = False\n'
+        )
+        template = re.sub(
+            old_curr_block,
+            '',
+            template,
+            flags=re.DOTALL,
+        )
+        # Fix RobotPlayEnvCfg to handle None terrain_generator
+        template = template.replace(
+            'self.scene.terrain.terrain_generator.num_rows = 2\n'
+            '        self.scene.terrain.terrain_generator.num_cols = 10',
+            '# terrain_generator is None in plane mode\n'
+            '        if self.scene.terrain.terrain_generator is not None:\n'
+            '            self.scene.terrain.terrain_generator.num_rows = 2\n'
+            '            self.scene.terrain.terrain_generator.num_cols = 10',
+        )
+    else:
+        template = re.sub(
+            r'self\.scene\.terrain\.terrain_generator\.curriculum = (True|False)',
+            f'self.scene.terrain.terrain_generator.curriculum = {curriculum_enabled}',
+            template,
+        )
+
+    output_path.write_text(template, encoding="utf-8")
+    logger.info("Generated env config: %s", output_path)
+    return output_path.resolve()

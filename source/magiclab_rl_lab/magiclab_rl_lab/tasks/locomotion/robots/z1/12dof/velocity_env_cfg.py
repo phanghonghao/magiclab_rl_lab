@@ -94,8 +94,8 @@ class EventCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-            "static_friction_range": (0.3, 1.0),
-            "dynamic_friction_range": (0.3, 1.0),
+            "static_friction_range": (0.1, 2.0),
+            "dynamic_friction_range": (0.1, 2.0),
             "restitution_range": (0.0, 0.0),
             "num_buckets": 64,
         },
@@ -106,7 +106,7 @@ class EventCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names="pelvis"),
-            "mass_distribution_params": (0.7, 1.3),
+            "mass_distribution_params": (0.5, 1.5),
             "operation": "scale",
             "recompute_inertia": True,
         },
@@ -117,7 +117,7 @@ class EventCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-            "mass_distribution_params": (0.7, 1.3),
+            "mass_distribution_params": (0.5, 1.5),
             "operation": "scale",
             "recompute_inertia": True,
         },
@@ -163,8 +163,8 @@ class EventCfg:
     push_robot = EventTerm(
         func=mdp.push_by_setting_velocity,
         mode="interval",
-        interval_range_s=(5.0, 5.0),
-        params={"velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}},
+        interval_range_s=(3.0, 5.0),
+        params={"velocity_range": {"x": (-1.0, 1.0), "y": (-1.0, 1.0)}},
     )
 
 
@@ -241,8 +241,8 @@ class ObservationsCfg:
         """Observations for policy group."""
 
         # observation terms (order preserved)
-        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=0.2, noise=Unoise(n_min=-0.2, n_max=0.2))
-        projected_gravity = ObsTerm(func=mdp.projected_gravity, noise=Unoise(n_min=-0.1, n_max=0.1))
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=0.2, noise=Unoise(n_min=-0.3, n_max=0.3))
+        projected_gravity = ObsTerm(func=mdp.projected_gravity, noise=Unoise(n_min=-0.15, n_max=0.15))
         velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
         joint_pos_rel = ObsTerm(func=mdp.joint_pos_rel,
                                 params={"asset_cfg": SceneEntityCfg("robot", 
@@ -261,7 +261,7 @@ class ObservationsCfg:
                                     "right_ankle_roll_joint",
                                 ], 
                                 preserve_order=True)},
-                                noise=Unoise(n_min=-0.02, n_max=0.02))
+                                noise=Unoise(n_min=-0.05, n_max=0.05))
         joint_vel_rel = ObsTerm(func=mdp.joint_vel_rel,
                                 params={"asset_cfg": SceneEntityCfg("robot", 
                                 joint_names=[
@@ -279,7 +279,7 @@ class ObservationsCfg:
                                     "right_ankle_roll_joint",
                                 ], 
                                 preserve_order=True)},
-                                scale=0.05, noise=Unoise(n_min=-1.5, n_max=1.5))
+                                scale=0.05, noise=Unoise(n_min=-2.0, n_max=2.0))
         last_action = ObsTerm(func=mdp.last_action,
                                 clip=(-100.0, 100.0),
                                 scale=1.0,
@@ -378,8 +378,8 @@ class RewardsCfg:
     base_linear_velocity = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
     base_angular_velocity = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
     joint_vel = RewTerm(func=mdp.joint_vel_l2, weight=-0.001)
-    joint_acc = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7)
-    action_rate = RewTerm(func=mdp.action_rate_l1, weight=-0.05)
+    joint_acc = RewTerm(func=mdp.joint_acc_l2, weight=-5e-7)
+    action_rate = RewTerm(func=mdp.action_rate_l1, weight=-0.1)
     dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=-5.0)
     energy = RewTerm(func=mdp.energy, weight=-2e-5)
 
@@ -522,7 +522,7 @@ class RobotEnvCfg(ManagerBasedRLEnvCfg):
     """Configuration for the locomotion velocity-tracking environment."""
 
     # Scene settings
-    scene: RobotSceneCfg = RobotSceneCfg(num_envs=4096, env_spacing=2.5)
+    scene: RobotSceneCfg = RobotSceneCfg(num_envs=16384, env_spacing=2.5)
     # Basic settings
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
