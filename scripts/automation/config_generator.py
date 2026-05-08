@@ -52,7 +52,7 @@ def _build_terrain_generator_block(terrain_cfg: Optional[dict]) -> str:
         lines.append("    sub_terrains={")
         _type_map = {
             "MeshPlaneTerrainCfg": "terrain_gen.MeshPlaneTerrainCfg",
-            "RandomGridTerrainCfg": "terrain_gen.RandomGridTerrainCfg",
+            "RandomGridTerrainCfg": "terrain_gen.MeshRandomGridTerrainCfg",
             "StairsTerrainCfg": "terrain_gen.StairsTerrainCfg",
             "GapTerrainCfg": "terrain_gen.GapTerrainCfg",
             "BoxesTerrainCfg": "terrain_gen.BoxesTerrainCfg",
@@ -60,7 +60,12 @@ def _build_terrain_generator_block(terrain_cfg: Optional[dict]) -> str:
         for name, scfg in subs.items():
             cls_name = _type_map.get(scfg.get("type", ""), "terrain_gen.MeshPlaneTerrainCfg")
             parts = [f'proportion={scfg.get("proportion", 0.5)}']
-            if "difficulty_range" in scfg:
+            # MeshRandomGridTerrainCfg needs grid_width + grid_height_range, not difficulty_range
+            if scfg.get("type") == "RandomGridTerrainCfg":
+                diff = scfg.get("difficulty_range", [0.0, 0.5])
+                parts.append(f'grid_width=0.6')
+                parts.append(f'grid_height_range=({diff[0]}, {diff[1]})')
+            elif "difficulty_range" in scfg:
                 parts.append(f'difficulty_range={scfg["difficulty_range"]!r}')
             lines.append(f'        "{name}": {cls_name}({", ".join(parts)}),')
         lines.append("    },")

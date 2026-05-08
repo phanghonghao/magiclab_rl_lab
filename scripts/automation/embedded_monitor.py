@@ -61,12 +61,14 @@ class EmbeddedMonitor:
         on_overfitting: Optional[Callable[[RunState], None]] = None,
         action_rate_threshold: float = -1.0,
         min_iterations: int = 2000,
+        reward_decline_pct: float = 20.0,
     ):
         self._cfg = MonitorConfig(
             log_root=log_root,
             terrain_type=terrain_type,
             action_rate_threshold=action_rate_threshold,
             min_iterations=min_iterations,
+            reward_decline_pct=reward_decline_pct,
         )
         self._detector = OverfittingDetector(self._cfg)
         self._tracker = BestModelTracker(window=10)
@@ -74,6 +76,7 @@ class EmbeddedMonitor:
 
         self._state: Optional[RunState] = None
         self._overfitting_fired = False
+        self._phase_start_iter: Optional[int] = None
 
     # -- Setup --------------------------------------------------------------- #
 
@@ -87,8 +90,26 @@ class EmbeddedMonitor:
         run_name = Path(run_dir).name
         self._state = RunState(run_name=run_name, run_dir=run_dir)
         self._overfitting_fired = False
+        self._phase_start_iter = None  # set on first data in poll()
         self._baseline_iter: Optional[int] = None  # first observed iter
         logger.info("Monitor started for run: %s", run_name)
+
+    # -- Phase reset --------------------------------------------------------- #
+
+    def reset_for_new_phase(self) -> None:
+        """Reset monitor state for a new sub-phase.
+
+        Called by the orchestrator when switching to a new sub-phase so that
+        iteration counters (``_phase_start_iter``) and overfitting flags are
+        cleared, even though the underlying ``RunState`` may already carry
+        residual data from a resumed run.
+        """
+        self._phase_start_iter = None
+        self._overfitting_fired = False
+        if self._state is not None:
+            self._state.overfitting_detected = False
+            self._state.overfitting_reason = None
+        logger.info("Monitor reset for new sub-phase")
 
     # -- Poll ---------------------------------------------------------------- #
 
@@ -159,13 +180,15 @@ class EmbeddedMonitor:
         if self._baseline_iter is None and state.rewards:
             self._baseline_iter = state.rewards[0][0]
             logger.info("Baseline iteration: %d", self._baseline_iter)
+        if self._phase_start_iter is None and state.rewards:
+            self._phase_start_iter = state.rewards[0][0]
+            logger.info("Phase start iteration: %d", self._phase_start_iter)
 
-        # Overfitting check — adjust min_iterations to be relative to baseline
-        saved_min = self._cfg.min_iterations
-        if self._baseline_iter is not None:
-            self._cfg.min_iterations = saved_min + self._baseline_iter
-        reason = self._detector.check(state)
-        self._cfg.min_iterations = saved_min  # restore
+        # Overfitting check — pass phase_start_iter for relative iteration gating
+        reason = self._detector.check(
+            state,
+            phase_start_iter=self._phase_start_iter or 0,
+        )
         if reason and not state.overfitting_detected:
             state.overfitting_detected = True
             state.overfitting_reason = reason

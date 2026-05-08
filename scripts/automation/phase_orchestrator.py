@@ -88,12 +88,14 @@ class PhaseOrchestrator:
         dry_run: bool = False,
         smoke_test: bool = False,
         num_gpus: int = 4,
+        adopt: bool = False,
     ):
         self._project_root = Path(project_root).resolve()
         self._poll_interval = poll_interval
         self._dry_run = dry_run
         self._smoke_test = smoke_test
         self._num_gpus = num_gpus
+        self._adopt = adopt
 
         # Components
         self._phase_mgr = PhaseManager(plan_path)
@@ -149,6 +151,13 @@ class PhaseOrchestrator:
             else:
                 logger.info("State found but PID %s is dead — marking as failed", pid)
                 self._state.current_stage_status = "failed"
+
+        # Adopt a currently running training that was started manually
+        if self._adopt and (self._state is None or self._state.current_stage_status != "running"):
+            self._adopt_existing_training()
+            if self._state is None:
+                logger.error("Adopt failed — no running training found")
+                return
 
         if self._state is None or self._state.current_stage_status in ("complete", "failed"):
             self._init_new_run()
@@ -385,6 +394,10 @@ class PhaseOrchestrator:
 
         if run_dir is None:
             logger.error("Could not find run directory for '%s' after 4 min", sp_id)
+            if self._proc and self._proc.pid:
+                logger.info("Stopping training PID %d after run dir failure", self._proc.pid)
+                self._launcher.graceful_stop(self._proc.pid)
+                self._proc = None
             self._state.current_stage_status = "failed"
             return
 
@@ -396,8 +409,10 @@ class PhaseOrchestrator:
             on_overfitting=self._on_overfitting_callback,
             action_rate_threshold=monitor_cfg.get("action_rate_threshold", -1.0),
             min_iterations=monitor_cfg.get("min_iterations", 2000),
+            reward_decline_pct=monitor_cfg.get("reward_decline_pct", 20.0),
         )
         self._monitor.start(run_dir)
+        self._monitor.reset_for_new_phase()
 
         # 8) Update state
         self._state.training_pid = self._proc.pid
@@ -527,8 +542,8 @@ class PhaseOrchestrator:
         self._state.best_reward = best_reward
         self._state.starting_reward = best_reward  # for next sub-phase
 
-        # 5) Record video
-        self._record_video(sp_id, best_ckpt)
+        # 5) Post-phase artifacts (JIT export, MuJoCo video, Isaac video, plots)
+        self._run_post_phase_pipeline(sp_id, best_ckpt)
 
         # 6) Check if this is the last sub-phase of a phase
         self._check_phase_completion()
@@ -564,6 +579,10 @@ class PhaseOrchestrator:
         max_retries = 2
 
         if self._state.retry_count < max_retries:
+            old_pid = self._state.training_pid
+            if old_pid and TrainingLauncher.is_running(old_pid):
+                logger.info("Killing previous PID %d before retry", old_pid)
+                self._launcher.graceful_stop(old_pid)
             self._state.retry_count += 1
             logger.warning("Sub-phase '%s' failed — retry %d/%d",
                            sp_id, self._state.retry_count, max_retries)
@@ -634,6 +653,12 @@ class PhaseOrchestrator:
 
         video_file = video_dir / f"{sp_id}.mp4"
 
+        # Read video parameters from YAML defaults
+        post_phase = self._phase_mgr.defaults.get("post_phase", {})
+        isaac_cfg = post_phase.get("isaac", {})
+        video_length = isaac_cfg.get("video_length", 400)
+        num_envs = isaac_cfg.get("num_envs", 16)
+
         logger.info("Recording video for '%s'...", sp_id)
         try:
             cmd = [
@@ -641,10 +666,10 @@ class PhaseOrchestrator:
                 f"--task={self._phase_mgr.task}",
                 "--headless",
                 "--video",
-                "--video_length=400",
+                f"--video_length={video_length}",
                 f"--load_run={run_dir.name}",
                 f"--checkpoint={ckpt_name}",
-                "--num_envs=16",
+                f"--num_envs={num_envs}",
             ]
             result = subprocess.run(
                 cmd,
@@ -660,6 +685,274 @@ class PhaseOrchestrator:
             logger.warning("Video recording timed out for '%s'", sp_id)
         except Exception as exc:
             logger.warning("Video recording failed for '%s': %s", sp_id, exc)
+
+    # ── Post-phase artifact pipeline ──────────────────────────── #
+
+    def _run_post_phase_pipeline(self, sp_id: str, best_ckpt: Optional[str]) -> None:
+        """Run post-phase artifact pipeline: JIT → MuJoCo → Isaac → label → plots."""
+        post_phase = self._phase_mgr.defaults.get("post_phase", {})
+        mujoco_cfg = post_phase.get("mujoco", {})
+
+        # 1) JIT export
+        jit_path = None
+        if post_phase.get("enable_jit_export", True) and best_ckpt:
+            jit_path = self._export_jit(sp_id, best_ckpt)
+
+        # 2) MuJoCo recording (depends on JIT)
+        if post_phase.get("enable_mujoco_video", True) and jit_path:
+            self._record_mujoco_video(sp_id, jit_path, mujoco_cfg)
+
+        # 3) Isaac Sim recording (existing)
+        if post_phase.get("enable_isaac_video", True):
+            self._record_video(sp_id, best_ckpt)
+
+        # 4) Label videos with metrics
+        if post_phase.get("enable_video_labels", True):
+            metrics = self._parse_training_metrics(sp_id)
+            self._label_videos(sp_id, metrics)
+
+        # 5) Generate plots
+        if post_phase.get("enable_plots", True) and self._state.training_run_dir:
+            self._generate_plots(sp_id, self._state.training_run_dir)
+
+    def _export_jit(self, sp_id: str, checkpoint: str) -> Optional[str]:
+        """Export the best checkpoint as a JIT policy. Returns path to policy.pt or None."""
+        export_script = self._project_root / "scripts" / "export_jit.py"
+        if not export_script.exists():
+            logger.warning("export_jit.py not found — skipping JIT export")
+            return None
+
+        ckpt_dir = str(Path(checkpoint).parent)
+        expected_output = Path(ckpt_dir) / "exported" / "policy.pt"
+
+        logger.info("Exporting JIT policy for '%s'...", sp_id)
+        try:
+            cmd = [
+                "python", "-u", str(export_script),
+                f"--checkpoint={checkpoint}",
+            ]
+            result = subprocess.run(
+                cmd,
+                cwd=str(self._project_root),
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if result.returncode != 0:
+                logger.warning("JIT export failed for '%s': %s",
+                               sp_id, result.stderr[-500:] if result.stderr else "unknown")
+                return None
+            if expected_output.exists():
+                logger.info("JIT policy exported: %s", expected_output)
+                return str(expected_output)
+            else:
+                logger.warning("JIT export succeeded but output not found at %s", expected_output)
+                return None
+        except subprocess.TimeoutExpired:
+            logger.warning("JIT export timed out for '%s'", sp_id)
+            return None
+        except Exception as exc:
+            logger.warning("JIT export failed for '%s': %s", sp_id, exc)
+            return None
+
+    def _record_mujoco_video(self, sp_id: str, jit_policy_path: str,
+                             mujoco_cfg: dict) -> None:
+        """Record a MuJoCo sim-to-sim video using the exported JIT policy."""
+        mujoco_script = self._project_root / "sim2sim" / "mujoco_manual.py"
+        if not mujoco_script.exists():
+            logger.warning("mujoco_manual.py not found — skipping MuJoCo recording")
+            return
+
+        video_dir = self._project_root / "videos" / "phase_pipeline"
+        video_dir.mkdir(parents=True, exist_ok=True)
+        video_file = video_dir / f"{sp_id}_mujoco.mp4"
+
+        mjcf_path = Path.home() / "magicbot-z1_description" / "mjcf" / "MAGICBOTZ1.xml"
+        if not mjcf_path.exists():
+            logger.warning("MJCF not found at %s — skipping MuJoCo recording", mjcf_path)
+            return
+
+        num_steps = mujoco_cfg.get("num_steps", 500)
+        vel_x = mujoco_cfg.get("vel_x", 0.5)
+
+        logger.info("Recording MuJoCo video for '%s'...", sp_id)
+        try:
+            cmd = [
+                "python", "-u", str(mujoco_script),
+                f"--mjcf={mjcf_path}",
+                f"--policy={jit_policy_path}",
+                f"--record={video_file}",
+                f"--num_steps={num_steps}",
+                f"--vel_x={vel_x}",
+            ]
+            result = subprocess.run(
+                cmd,
+                cwd=str(self._project_root),
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if result.returncode != 0:
+                logger.warning("MuJoCo recording failed for '%s': %s",
+                               sp_id, result.stderr[-500:] if result.stderr else "unknown")
+            else:
+                logger.info("MuJoCo video recorded: %s", video_file)
+        except subprocess.TimeoutExpired:
+            logger.warning("MuJoCo recording timed out for '%s'", sp_id)
+        except Exception as exc:
+            logger.warning("MuJoCo recording failed for '%s': %s", sp_id, exc)
+
+    def _generate_plots(self, sp_id: str, run_dir: str) -> None:
+        """Generate learning curve plots for the sub-phase."""
+        plot_script = self._project_root / "scripts" / "plot_learning_curves.py"
+        if not plot_script.exists():
+            logger.warning("plot_learning_curves.py not found — skipping plot generation")
+            return
+
+        output_dir = self._project_root / "plots" / sp_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        run_dir_name = Path(run_dir).name
+
+        logger.info("Generating plots for '%s'...", sp_id)
+        try:
+            cmd = [
+                "python", "-u", str(plot_script),
+                f"--log_root={self._log_root}",
+                f"--focus_run={run_dir_name}",
+                f"--output_dir={output_dir}",
+            ]
+            result = subprocess.run(
+                cmd,
+                cwd=str(self._project_root),
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if result.returncode != 0:
+                logger.warning("Plot generation failed for '%s': %s",
+                               sp_id, result.stderr[-500:] if result.stderr else "unknown")
+            else:
+                logger.info("Plots generated: %s", output_dir)
+        except subprocess.TimeoutExpired:
+            logger.warning("Plot generation timed out for '%s'", sp_id)
+        except Exception as exc:
+            logger.warning("Plot generation failed for '%s': %s", sp_id, exc)
+
+    # ── Video labeling ─────────────────────────────────────────── #
+
+    def _parse_training_metrics(self, sp_id: str) -> dict:
+        """Parse the last training log block to extract behavioral metrics.
+
+        Returns a dict with keys: time_out, bad_ori, vel_err, ep_len, reward,
+        action_rate.  Values are floats; missing metrics default to None.
+        """
+        log_file = self._project_root / "logs" / f"train_{sp_id}.log"
+        metrics: dict = {}
+        if not log_file.exists():
+            return metrics
+
+        try:
+            # Read last 8KB (enough for the last iteration block)
+            with open(log_file, "r", encoding="utf-8", errors="ignore") as fh:
+                fh.seek(max(0, log_file.stat().st_size - 8192))
+                tail = fh.read()
+
+            # Extract the last complete iteration block (between --- separators)
+            blocks = tail.split("-" * 80)
+            if not blocks:
+                blocks = [tail]
+            last_block = blocks[-1]
+
+            # Parse known metric lines
+            _mapping = {
+                "Episode_Termination/time_out:": ("time_out", float),
+                "Episode_Termination/bad_orientation:": ("bad_ori", float),
+                "Metrics/base_velocity/error_vel_xy:": ("vel_err", float),
+                "Mean episode length:": ("ep_len", float),
+                "Mean reward:": ("reward", float),
+                "Episode_Reward/action_rate_l1:": ("action_rate", float),
+            }
+            for line in last_block.splitlines():
+                line = line.strip()
+                for prefix, (key, cast) in _mapping.items():
+                    if prefix in line:
+                        # Take the number after the colon/keyword
+                        val_str = line.split(prefix)[-1].strip()
+                        try:
+                            metrics[key] = cast(val_str)
+                        except (ValueError, TypeError):
+                            pass
+                        break
+        except Exception as exc:
+            logger.warning("Failed to parse training metrics for '%s': %s", sp_id, exc)
+
+        return metrics
+
+    def _label_videos(self, sp_id: str, metrics: dict) -> None:
+        """Label Isaac Sim and MuJoCo videos with training metrics."""
+        label_script = self._project_root / "scripts" / "label_video.py"
+        if not label_script.exists():
+            logger.warning("label_video.py not found — skipping video labeling")
+            return
+
+        video_dir = self._project_root / "videos" / "phase_pipeline"
+        model_name = Path(self._state.best_model_path).name if self._state.best_model_path else sp_id
+
+        # Build label arguments common to both videos
+        base_args = [str(label_script)]
+        base_args.append(f"--run={sp_id}")
+        base_args.append(f"--model={model_name}")
+        if "time_out" in metrics:
+            base_args.append(f"--time-out={metrics['time_out']:.4f}")
+        if "bad_ori" in metrics:
+            base_args.append(f"--bad-ori={metrics['bad_ori']:.4f}")
+        if "vel_err" in metrics:
+            base_args.append(f"--vel-err={metrics['vel_err']:.4f}")
+        if "ep_len" in metrics:
+            base_args.append(f"--ep-len={metrics['ep_len']:.0f}")
+
+        # Extra context lines
+        extras = []
+        if "reward" in metrics:
+            extras.append(f"reward: {metrics['reward']:.2f}")
+        if "action_rate" in metrics:
+            extras.append(f"action_rate: {metrics['action_rate']:.3f}")
+        if extras:
+            base_args.append("--extra")
+            base_args.extend(extras)
+
+        # Label each video that exists
+        for suffix in ["", "_mujoco"]:
+            video_path = video_dir / f"{sp_id}{suffix}.mp4"
+            if not video_path.exists():
+                continue
+
+            labeled_path = video_dir / f"{sp_id}{suffix}_labeled.mp4"
+            cmd = base_args + [str(video_path), "-o", str(labeled_path)]
+
+            logger.info("Labeling video %s...", video_path.name)
+            try:
+                result = subprocess.run(
+                    cmd,
+                    cwd=str(self._project_root),
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if result.returncode != 0:
+                    logger.warning("Video labeling failed for '%s': %s",
+                                   video_path.name,
+                                   result.stderr[-300:] if result.stderr else "unknown")
+                    continue
+
+                # Overwrite original with labeled version
+                shutil.move(str(labeled_path), str(video_path))
+                logger.info("Video labeled: %s", video_path)
+            except subprocess.TimeoutExpired:
+                logger.warning("Video labeling timed out for '%s'", video_path.name)
+            except Exception as exc:
+                logger.warning("Video labeling failed for '%s': %s", video_path.name, exc)
 
     # ── Config helpers ──────────────────────────────────────────── #
 
@@ -692,6 +985,168 @@ class PhaseOrchestrator:
 
         return None
 
+    # ── Adopt ───────────────────────────────────────────────────── #
+
+    def _adopt_existing_training(self) -> None:
+        """Detect a running training process and adopt it into the orchestrator."""
+        info = self._detect_running_training()
+        if info is None:
+            logger.warning("No running training process found to adopt")
+            return
+
+        pid = info["pid"]
+        logger.info("Found running training: PID=%d, args=%s", pid, info)
+
+        # Extract run_name from parsed args
+        run_name = info.get("run_name", "")
+        if not run_name:
+            logger.error("Cannot adopt: --run_name not found in process args")
+            return
+
+        # Infer sub-phase ID from agent_cfg path or run_name
+        sp_id = self._infer_sub_phase_id(info)
+        if not sp_id:
+            logger.error("Cannot adopt: could not infer sub-phase ID from args=%s", info)
+            return
+
+        # Find actual run directory
+        run_dir = self._find_latest_run_dir(run_name)
+        if not run_dir:
+            logger.error("Cannot adopt: no run directory found for run_name='%s'", run_name)
+            return
+
+        phase_id = self._get_phase_id(sp_id)
+
+        self._state = OrchestratorState(
+            plan_name=self._phase_mgr.plan_name,
+            current_stage_id=sp_id,
+            current_phase_id=phase_id,
+            current_stage_status="running",
+            training_pid=pid,
+            training_run_dir=run_dir,
+            started_at=datetime.now().isoformat(),
+        )
+        self._state_store.save(self._state)
+
+        # Attach monitor
+        self._resume_monitor()
+
+        logger.info("Adopted training: sp='%s', pid=%d, run_dir=%s", sp_id, pid, run_dir)
+
+    def _detect_running_training(self) -> Optional[dict]:
+        """Find running training process and extract args."""
+        try:
+            result = subprocess.run(
+                ["ps", "aux"], capture_output=True, text=True, timeout=10,
+            )
+        except Exception as e:
+            logger.error("Failed to run ps: %s", e)
+            return None
+
+        # Collect candidate processes — prefer direct python processes over bash wrappers
+        candidates = []
+        for line in result.stdout.splitlines():
+            if "grep" in line:
+                continue
+            # Direct python worker: python train_multigpu.py --run_name=...
+            if "train_multigpu.py" in line and "python" in line and "bash" not in line:
+                candidates.append(("worker", int(line.split()[1]), line))
+            # torchrun launcher process
+            elif "torchrun" in line and "train_multigpu" in line and "python" in line:
+                candidates.append(("torchrun", int(line.split()[1]), line))
+            # Single-GPU train.py
+            elif "train.py" in line and "Magiclab" in line and "bash" not in line:
+                candidates.append(("single", int(line.split()[1]), line))
+
+        # Priority: worker > torchrun > single
+        for ptype, pid, line in candidates:
+            if ptype == "worker":
+                # Worker has direct args in --key=value format
+                args = self._parse_cmdline(pid)
+                if args.get("run_name"):
+                    return {"pid": pid, **args}
+
+        for ptype, pid, line in candidates:
+            if ptype == "torchrun":
+                # torchrun launcher — try its cmdline first, then children
+                args = self._parse_cmdline(pid)
+                if args.get("run_name"):
+                    return {"pid": pid, **args}
+                # Try children
+                try:
+                    children = subprocess.run(
+                        ["pgrep", "-P", str(pid)],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    child_pids = children.stdout.strip().splitlines()
+                    for cp in child_pids:
+                        args = self._parse_cmdline(int(cp))
+                        if args.get("run_name"):
+                            return {"pid": pid, **args}
+                except Exception:
+                    pass
+
+        for ptype, pid, line in candidates:
+            if ptype == "single":
+                args = self._parse_cmdline(pid)
+                if args.get("run_name"):
+                    return {"pid": pid, **args}
+
+        return None
+
+    def _parse_cmdline(self, pid: int) -> dict:
+        """Read /proc/PID/cmdline to extract training args."""
+        try:
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", errors="ignore")
+            parts = cmdline.split("\0")
+            args = {}
+            for i, p in enumerate(parts):
+                if p.startswith("--"):
+                    raw = p.lstrip("-")
+                    # Handle --key=value format (torchrun uses this)
+                    if "=" in raw:
+                        k, v = raw.split("=", 1)
+                        key = k.replace("-", "_")
+                        args[key] = v
+                    else:
+                        key = raw.replace("-", "_")
+                        if i + 1 < len(parts) and not parts[i + 1].startswith("--"):
+                            args[key] = parts[i + 1]
+                        else:
+                            args[key] = True
+            return args
+        except (FileNotFoundError, PermissionError):
+            return {}
+
+    def _infer_sub_phase_id(self, info: dict) -> Optional[str]:
+        """Infer sub-phase ID from agent_cfg path or run_name."""
+        # Try agent_cfg path first (e.g. tmp/phase_configs/p3_coarse/...)
+        agent_cfg = info.get("agent_cfg", "")
+        if agent_cfg:
+            # Extract sub-phase from path like .../tmp/phase_configs/p3_coarse/...
+            parts = Path(agent_cfg).parts
+            for i, part in enumerate(parts):
+                if part == "phase_configs" and i + 1 < len(parts):
+                    candidate = parts[i + 1]
+                    # Validate against plan
+                    if self._phase_mgr.get_sub_phase(candidate):
+                        return candidate
+
+        # Fallback: try matching run_name against plan sub-phase IDs
+        run_name = info.get("run_name", "")
+        for sp in self._phase_mgr.all_sub_phases:
+            if sp.id in run_name:
+                return sp.id
+
+        # Last resort: strip common suffixes and try direct match
+        if run_name:
+            for suffix in ("_v2", "_v3", "_resume", "_retry"):
+                cleaned = run_name.replace(suffix, "")
+                if self._phase_mgr.get_sub_phase(cleaned):
+                    return cleaned
+
+        return None
+
     # ── Callbacks ───────────────────────────────────────────────── #
 
     def _on_overfitting_callback(self, run_state) -> None:
@@ -715,8 +1170,10 @@ class PhaseOrchestrator:
                 on_overfitting=self._on_overfitting_callback,
                 action_rate_threshold=monitor_cfg.get("action_rate_threshold", -1.0),
                 min_iterations=monitor_cfg.get("min_iterations", 2000),
+                reward_decline_pct=monitor_cfg.get("reward_decline_pct", 20.0),
             )
             self._monitor.start(run_dir)
+            self._monitor.reset_for_new_phase()
             logger.info("Monitor re-attached to '%s'", sp_id)
         else:
             logger.warning("Run dir '%s' not found — cannot re-attach monitor", run_dir)
@@ -862,6 +1319,8 @@ def parse_args():
     parser.add_argument("--state-file", type=str, default="orchestrator_state.json",
                         help="Filename for crash-recovery state")
     parser.add_argument("--num-gpus", type=int, default=4, help="Number of GPUs for distributed training")
+    parser.add_argument("--adopt", action="store_true",
+                        help="Adopt a currently running training session (do not launch new training)")
     return parser.parse_args()
 
 
@@ -878,6 +1337,7 @@ def main():
         dry_run=args.dry_run,
         smoke_test=args.smoke_test,
         num_gpus=args.num_gpus,
+        adopt=args.adopt,
     )
     orchestrator.run()
 

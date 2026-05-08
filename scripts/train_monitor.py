@@ -293,13 +293,23 @@ class OverfittingDetector:
     def __init__(self, cfg: MonitorConfig):
         self.cfg = cfg
 
-    def check(self, state: RunState) -> Optional[str]:
-        """Return alert reason string, or None if healthy."""
+    def check(self, state: RunState, phase_start_iter: int = 0) -> Optional[str]:
+        """Return alert reason string, or None if healthy.
+
+        Parameters
+        ----------
+        phase_start_iter:
+            Iteration number at which the current sub-phase started.
+            *min_iterations* is interpreted relative to this value so that
+            resumed runs (which continue iterating from e.g. 10500) still
+            respect the grace period correctly.
+        """
         # Need minimum data
         if not state.rewards:
             return None
         latest_iter = state.rewards[-1][0]
-        if latest_iter < self.cfg.min_iterations:
+        relative_iter = latest_iter - phase_start_iter
+        if relative_iter < self.cfg.min_iterations:
             return None
 
         # 1. Reward decline from peak

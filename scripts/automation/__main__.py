@@ -1,6 +1,6 @@
-"""Allow running the orchestrator as ``python -m automation.orchestrator``."""
+"""Allow running the orchestrator as ``python -m automation``."""
 
-from automation.orchestrator import main
+from automation.phase_orchestrator import main
 
 if __name__ == "__main__":
     main()
