@@ -383,17 +383,19 @@ class PhaseOrchestrator:
         )
 
         # 6) Wait for Isaac Sim to create run directory
+        # Multi-GPU Isaac Sim init can take 10+ minutes
+        max_attempts = 28 if self._num_gpus > 1 else 16
         logger.info("Waiting for Isaac Sim to create run directory...")
         run_dir = None
-        for attempt in range(8):
+        for attempt in range(max_attempts):
             time.sleep(30)
             run_dir = self._find_latest_run_dir(run_name)
             if run_dir is not None:
                 break
-            logger.info("Run directory not found (attempt %d/8)...", attempt + 1)
+            logger.info("Run directory not found (attempt %d/%d)...", attempt + 1, max_attempts)
 
         if run_dir is None:
-            logger.error("Could not find run directory for '%s' after 4 min", sp_id)
+            logger.error("Could not find run directory for '%s' after %d min", sp_id, max_attempts * 30 // 60)
             if self._proc and self._proc.pid:
                 logger.info("Stopping training PID %d after run dir failure", self._proc.pid)
                 self._launcher.graceful_stop(self._proc.pid)
@@ -553,6 +555,36 @@ class PhaseOrchestrator:
         logger.info("Sub-phase '%s' complete — best: %s (reward: %s)",
                      sp_id, best_ckpt, best_reward)
 
+    def _wait_for_kit_cleanup(self, timeout: int = 60) -> None:
+        """Wait for Omniverse Kit processes to fully exit to avoid KVDB lock conflicts."""
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                result = subprocess.run(
+                    ["pgrep", "-f", "omni.kit|kit_"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                kit_pids = [p for p in result.stdout.strip().split('\n') if p.strip()]
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                # pgrep not available (non-Linux) — skip cleanup
+                logger.debug("pgrep not available, skipping Kit cleanup wait")
+                return
+
+            if not kit_pids:
+                logger.info("All Kit processes exited, safe to proceed")
+                return
+            logger.debug("Kit processes still running (PIDs: %s), waiting...", kit_pids)
+            time.sleep(5)
+
+        logger.warning("Kit processes still running after %ds: %s — force killing",
+                       timeout, kit_pids)
+        for pid_str in kit_pids:
+            try:
+                os.kill(int(pid_str), signal.SIGKILL)
+            except (ProcessLookupError, ValueError):
+                pass
+        time.sleep(5)
+
     def _advance(self) -> None:
         """Move to next sub-phase or finish."""
         current_id = self._state.current_stage_id
@@ -564,6 +596,10 @@ class PhaseOrchestrator:
                          self._state.plan_name, datetime.now().isoformat())
             self._state_store.save(self._state)
             sys.exit(0)
+
+        # Wait for Kit cleanup before starting next sub-phase to prevent
+        # KVDB lock conflicts from the previous training's Omniverse session.
+        self._wait_for_kit_cleanup()
 
         logger.info("Advancing: '%s' → '%s'", current_id, next_sp.id)
         self._state.current_stage_id = next_sp.id
@@ -897,7 +933,7 @@ class PhaseOrchestrator:
             return
 
         video_dir = self._project_root / "videos" / "phase_pipeline"
-        model_name = Path(self._state.best_model_path).name if self._state.best_model_path else sp_id
+        model_name = Path(self._state.best_checkpoint_path).name if self._state.best_checkpoint_path else sp_id
 
         # Build label arguments common to both videos
         base_args = [str(label_script)]
