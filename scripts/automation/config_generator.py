@@ -138,6 +138,10 @@ _REWARD_DEFS = {
         "mdp.joint_deviation_l1",
         '"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_roll_joint", ".*_hip_yaw_joint"])',
     ),
+    "joint_deviation_hip_knee": (
+        "mdp.joint_deviation_l1",
+        '"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_pitch_joint", ".*_knee_joint"])',
+    ),
     "flat_orientation_l2": ("mdp.flat_orientation_l2", None),
     "base_height": (
         "mdp.base_height_l2",
