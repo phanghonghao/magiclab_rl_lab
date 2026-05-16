@@ -50,18 +50,25 @@ PHASE_TERRAIN = {
 # ---------------------------------------------------------------------------
 # Terrain generation (matching Isaac Sim p3b config)
 # ---------------------------------------------------------------------------
-def generate_terrain_data(terrain_type="p3b", seed=42):
+def generate_terrain_data(terrain_type="p3b", seed=42, difficulty=1.0):
     """Generate terrain heightmap matching Isaac Sim training config.
+
+    Args:
+        terrain_type: "p3" or "p3b"
+        seed: Random seed for reproducibility
+        difficulty: Scale factor for terrain height (0-1). At 1.0, full height.
+                    For the current p3_coarse curriculum, use about 0.625.
 
     Returns: (nrow, ncol, half_x, half_y, max_elev, hmap)
     """
+    difficulty = float(np.clip(difficulty, 0.0, 1.0))
     H_SCALE = 0.1  # meters per grid cell (matches Isaac Sim horizontal_scale)
 
     if terrain_type == "p3":
-        # p3: gentle terrain — flat 70% + random_grid 30% (height 0-0.25m)
+        # p3: gentle terrain — flat 70% + random_grid 30% (height 0-0.4m)
         TERRAIN_L = 24.0
         TERRAIN_W = 8.0
-        MAX_ELEV = 0.25  # max height in p3 is 0.25m
+        MAX_ELEV = 0.4
     elif terrain_type == "p3b":
         # p3b: intermediate terrain — flat 50% + random_grid 30% + stairs 10% + boxes 10%
         TERRAIN_L = 24.0
@@ -120,7 +127,7 @@ def generate_terrain_data(terrain_type="p3b", seed=42):
     for c0, c1, stype in sections:
         if stype == "random_grid":
             if terrain_type == "p3":
-                fill_random_grid(0, nrow, c0, c1, h_range=(0.0, 0.25))
+                fill_random_grid(0, nrow, c0, c1, h_range=(0.0, 0.4))
             else:
                 fill_random_grid(0, nrow, c0, c1)
         elif stype == "stairs":
@@ -137,16 +144,27 @@ def generate_terrain_data(terrain_type="p3b", seed=42):
             padded[2:, :-2] + padded[2:, 1:-1] + padded[2:, 2:]
         ) / 9.0
 
+    if difficulty < 1.0:
+        hmap *= difficulty
+        effective_max = MAX_ELEV * difficulty
+        print(f"[TERRAIN] Difficulty={difficulty:.3f}: scaling height to {effective_max:.3f}m "
+              f"(was {MAX_ELEV:.3f}m)")
+    else:
+        effective_max = MAX_ELEV
+
     print(f"[TERRAIN] Generated {terrain_type}: {TERRAIN_L}m x {TERRAIN_W}m, "
-          f"grid {nrow}x{ncol}, elevation [{hmap.min()*MAX_ELEV:.3f}, {hmap.max()*MAX_ELEV:.3f}]m")
-    return nrow, ncol, TERRAIN_L / 2, TERRAIN_W / 2, MAX_ELEV, hmap
+          f"grid {nrow}x{ncol}, elevation [{hmap.min()*MAX_ELEV:.3f}, {hmap.max()*MAX_ELEV:.3f}]m, "
+          f"effective_max={effective_max:.3f}m")
+    return nrow, ncol, TERRAIN_L / 2, TERRAIN_W / 2, effective_max, hmap
 
 
-def load_model_with_terrain(mjcf_path, terrain_type):
+def load_model_with_terrain(mjcf_path, terrain_type, difficulty=1.0):
     """Load MuJoCo model with terrain hfield injected via Python API."""
     import mujoco
 
-    nrow, ncol, half_x, half_y, max_elev, terrain_data = generate_terrain_data(terrain_type)
+    nrow, ncol, half_x, half_y, max_elev, terrain_data = generate_terrain_data(
+        terrain_type, difficulty=difficulty
+    )
 
     # Read original XML
     with open(mjcf_path, 'r') as f:
@@ -184,6 +202,8 @@ def parse_args():
     parser.add_argument("--vel_yaw", type=float, default=0.0, help="Yaw velocity command (rad/s)")
     parser.add_argument("--keyboard", action="store_true", help="Use keyboard for velocity commands")
     parser.add_argument("--num_steps", type=int, default=10000, help="Number of control steps")
+    parser.add_argument("--terrain_difficulty", type=float, default=None,
+                        help="Scale terrain height by this factor (0-1). Example: current p3_coarse curriculum is about 0.625.")
     parser.add_argument("--record", type=str, default=None, help="Record video to this path (EGL offscreen)")
     parser.add_argument("--terrain", type=str, default=None, help="Terrain type: 'p3' or 'p3b'")
     parser.add_argument("--phase", type=str, default=None,
@@ -403,7 +423,7 @@ def compute_gait_phase(sim_time, vel_cmd, period=GAIT_PERIOD):
 
 
 class MuJoCoDeploy:
-    def __init__(self, mjcf_path, policy_runner, deploy_cfg=None, vel_cmd=None, terrain=None):
+    def __init__(self, mjcf_path, policy_runner, deploy_cfg=None, vel_cmd=None, terrain=None, terrain_difficulty=1.0):
         import mujoco
 
         self.policy = policy_runner
@@ -426,7 +446,7 @@ class MuJoCoDeploy:
 
         # Load model (with optional terrain)
         if terrain:
-            self.model = load_model_with_terrain(mjcf_path, terrain)
+            self.model = load_model_with_terrain(mjcf_path, terrain, difficulty=terrain_difficulty)
         else:
             self.model = mujoco.MjModel.from_xml_path(mjcf_path)
         self.model.opt.timestep = PHYSICS_DT
@@ -589,7 +609,19 @@ def main():
     elif terrain is not None and args.phase is not None:
         print(f"[INFO] Phase '{args.phase}' overridden by explicit --terrain '{terrain}'")
 
-    env = MuJoCoDeploy(args.mjcf, policy, deploy_cfg=deploy_cfg, vel_cmd=vel_cmd, terrain=terrain)
+    terrain_diff = args.terrain_difficulty if args.terrain_difficulty is not None else 1.0
+    if terrain == "p3" and args.terrain_difficulty is None:
+        print("[WARN] --terrain_difficulty not set; using full p3 height (1.0). "
+              "For the current p3_coarse run, ~0.625 is closer to the trained curriculum.")
+
+    env = MuJoCoDeploy(
+        args.mjcf,
+        policy,
+        deploy_cfg=deploy_cfg,
+        vel_cmd=vel_cmd,
+        terrain=terrain,
+        terrain_difficulty=terrain_diff,
+    )
     print(f"[INFO] MuJoCo model loaded from {args.mjcf}" +
           (f" with terrain={terrain}" if terrain else " (flat ground)"))
     print(f"[INFO] Control frequency: {1.0/CONTROL_DT:.0f}Hz, Physics: {1.0/PHYSICS_DT:.0f}Hz")

@@ -53,18 +53,27 @@ def _build_terrain_generator_block(terrain_cfg: Optional[dict]) -> str:
         _type_map = {
             "MeshPlaneTerrainCfg": "terrain_gen.MeshPlaneTerrainCfg",
             "RandomGridTerrainCfg": "terrain_gen.MeshRandomGridTerrainCfg",
-            "StairsTerrainCfg": "terrain_gen.StairsTerrainCfg",
-            "GapTerrainCfg": "terrain_gen.GapTerrainCfg",
-            "BoxesTerrainCfg": "terrain_gen.BoxesTerrainCfg",
+            "StairsTerrainCfg": "terrain_gen.MeshPyramidStairsTerrainCfg",
+            "GapTerrainCfg": "terrain_gen.MeshGapTerrainCfg",
+            "BoxesTerrainCfg": "terrain_gen.MeshBoxTerrainCfg",
         }
         for name, scfg in subs.items():
             cls_name = _type_map.get(scfg.get("type", ""), "terrain_gen.MeshPlaneTerrainCfg")
             parts = [f'proportion={scfg.get("proportion", 0.5)}']
-            # MeshRandomGridTerrainCfg needs grid_width + grid_height_range, not difficulty_range
-            if scfg.get("type") == "RandomGridTerrainCfg":
-                diff = scfg.get("difficulty_range", [0.0, 0.5])
+            # Each trimesh terrain type has its own height/width params (not difficulty_range)
+            terrain_type = scfg.get("type", "")
+            diff = scfg.get("difficulty_range", [0.0, 0.5])
+            d_max = diff[1] if len(diff) > 1 else 0.5
+            if terrain_type == "RandomGridTerrainCfg":
                 parts.append(f'grid_width=0.6')
-                parts.append(f'grid_height_range=({diff[0]}, {diff[1]})')
+                parts.append(f'grid_height_range=({diff[0]}, {d_max})')
+            elif terrain_type == "StairsTerrainCfg":
+                parts.append(f'step_height_range=(0.05, {d_max * 0.25:.2f})')
+                parts.append(f'step_width=0.3')
+            elif terrain_type == "BoxesTerrainCfg":
+                parts.append(f'box_height_range=(0.05, {d_max * 0.3:.2f})')
+            elif terrain_type == "GapTerrainCfg":
+                parts.append(f'gap_width_range=(0.1, {d_max * 0.5:.2f})')
             elif "difficulty_range" in scfg:
                 parts.append(f'difficulty_range={scfg["difficulty_range"]!r}')
             lines.append(f'        "{name}": {cls_name}({", ".join(parts)}),')
@@ -170,6 +179,18 @@ _REWARD_DEFS = {
         "mdp.undesired_contacts",
         '"threshold": 1, "sensor_cfg": SceneEntityCfg("contact_forces", '
         'body_names=["(?!.*ankle.*).*"])',
+    ),
+    "joint_mirror": (
+        "mdp.joint_mirror",
+        '"asset_cfg": SceneEntityCfg("robot"), '
+        '"mirror_joints": ['
+        '["left_hip_pitch_joint", "right_hip_pitch_joint"], '
+        '["left_hip_roll_joint", "right_hip_roll_joint"], '
+        '["left_hip_yaw_joint", "right_hip_yaw_joint"], '
+        '["left_knee_joint", "right_knee_joint"], '
+        '["left_ankle_pitch_joint", "right_ankle_pitch_joint"], '
+        '["left_ankle_roll_joint", "right_ankle_roll_joint"]], '
+        '"joint_weights": [1.0, 1.0, 1.0, 1.5, 3.0, 1.0]',
     ),
 }
 

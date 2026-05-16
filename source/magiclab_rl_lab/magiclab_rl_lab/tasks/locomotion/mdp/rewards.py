@@ -304,21 +304,87 @@ Other rewards.
 """
 
 
-def joint_mirror(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, mirror_joints: list[list[str]]) -> torch.Tensor:
-    # extract the used quantities (to enable type-hinting)
+def joint_mirror(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, mirror_joints: list[list[str]], joint_weights: list[float] = None) -> torch.Tensor:
+    """Mirrors joint positions between specified joint pairs.
+
+    Uses running statistics (mean, variance) over a sliding window to compare
+    left-right symmetry. This handles the anti-phase nature of bipedal walking:
+    instead of comparing instantaneous positions (which are naturally different
+    during stance/swing), it compares whether both legs produce similar motion
+    distributions over a gait cycle.
+
+    Args:
+        env: The environment instance
+        asset_cfg: Scene entity configuration for the robot
+        mirror_joints: List of joint pairs to mirror, e.g. [["left_hip_pitch_joint", "right_hip_pitch_joint"], ...]
+        joint_weights: Optional per-pair weights. Higher = stronger symmetry enforcement for that pair.
+                       e.g. [1.0, 1.0, 1.0, 1.0, 3.0, 1.0] makes ankle_pitch 3x more important.
+                       Defaults to uniform [1.0, ...] if not specified.
+    """
     asset: Articulation = env.scene[asset_cfg.name]
+    num_envs = env.num_envs
+    device = env.device
+
+    # Cache joint IDs on first call
     if not hasattr(env, "joint_mirror_joints_cache") or env.joint_mirror_joints_cache is None:
-        # Cache joint positions for all pairs
         env.joint_mirror_joints_cache = [
             [asset.find_joints(joint_name) for joint_name in joint_pair] for joint_pair in mirror_joints
         ]
-    reward = torch.zeros(env.num_envs, device=env.device)
-    # Iterate over all joint pairs
-    for joint_pair in env.joint_mirror_joints_cache:
-        # Calculate the difference for each pair and add to the total reward
-        reward += torch.sum(
-            torch.square(asset.data.joint_pos[:, joint_pair[0][0]] - asset.data.joint_pos[:, joint_pair[1][0]]),
-            dim=-1,
-        )
-    reward *= 1 / len(mirror_joints) if len(mirror_joints) > 0 else 0
+        # Per-joint weights (normalize to sum=1)
+        if joint_weights is None:
+            joint_weights = [1.0] * len(mirror_joints)
+        w = torch.tensor(joint_weights, device=device, dtype=torch.float32)
+        env._jm_weights = w / w.sum()
+        # Initialize running statistics buffers
+        n_pairs = len(mirror_joints)
+        env._jm_running_mean_L = torch.zeros(num_envs, n_pairs, device=device)
+        env._jm_running_mean_R = torch.zeros(num_envs, n_pairs, device=device)
+        env._jm_running_var_L = torch.zeros(num_envs, n_pairs, device=device)
+        env._jm_running_var_R = torch.zeros(num_envs, n_pairs, device=device)
+        env._jm_count = torch.zeros(num_envs, 1, device=device)
+        # Warmup steps before applying the penalty
+        env._jm_warmup = 30
+
+    reward = torch.zeros(num_envs, device=device)
+
+    # Check warmup
+    env._jm_count += 1
+    min_count = env._jm_count.min().item()
+    if min_count < env._jm_warmup:
+        # During warmup, just accumulate statistics, return zero penalty
+        pass
+    else:
+        # Compare running statistics between L and R, weighted by joint importance
+        mean_diff_per_joint = torch.square(env._jm_running_mean_L - env._jm_running_mean_R)  # (num_envs, n_pairs)
+        std_L = torch.sqrt(env._jm_running_var_L + 1e-8)
+        std_R = torch.sqrt(env._jm_running_var_R + 1e-8)
+        std_diff_per_joint = torch.square(std_L - std_R)  # (num_envs, n_pairs)
+        per_joint_penalty = mean_diff_per_joint + std_diff_per_joint  # (num_envs, n_pairs)
+        reward = torch.sum(per_joint_penalty * env._jm_weights.unsqueeze(0), dim=-1)  # weighted sum
+
+    # Update running statistics with exponential moving average
+    alpha = 0.05  # smoothing factor (~20-step effective window)
+    for i, joint_pair in enumerate(env.joint_mirror_joints_cache):
+        pos_L = asset.data.joint_pos[:, joint_pair[0][0]].squeeze(-1)
+        pos_R = asset.data.joint_pos[:, joint_pair[1][0]].squeeze(-1)
+
+        # Update running mean
+        env._jm_running_mean_L[:, i] = (1 - alpha) * env._jm_running_mean_L[:, i] + alpha * pos_L
+        env._jm_running_mean_R[:, i] = (1 - alpha) * env._jm_running_mean_R[:, i] + alpha * pos_R
+
+        # Update running variance
+        env._jm_running_var_L[:, i] = (1 - alpha) * env._jm_running_var_L[:, i] + alpha * (pos_L - env._jm_running_mean_L[:, i]) ** 2
+        env._jm_running_var_R[:, i] = (1 - alpha) * env._jm_running_var_R[:, i] + alpha * (pos_R - env._jm_running_mean_R[:, i]) ** 2
+
+    # Reset stats on episode reset (detect via count = 1)
+    # Note: Isaac Lab resets are handled by env.episode_length_buf
+    # When episode resets, the running stats are stale; we detect this
+    # by checking if step count is very small
+    reset_mask = (env.episode_length_buf < 2).float().unsqueeze(1)
+    env._jm_running_mean_L *= (1 - reset_mask)
+    env._jm_running_mean_R *= (1 - reset_mask)
+    env._jm_running_var_L *= (1 - reset_mask)
+    env._jm_running_var_R *= (1 - reset_mask)
+    env._jm_count *= (1 - reset_mask)
+
     return reward

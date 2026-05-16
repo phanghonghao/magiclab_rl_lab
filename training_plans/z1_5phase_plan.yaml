@@ -57,11 +57,12 @@ defaults:
     enable_video_labels: true
     enable_plots: true
     isaac:
-      video_length: 400
+      video_length: 1000
       num_envs: 16
     mujoco:
-      num_steps: 500
-      vel_x: 0.5
+      num_steps: 1000
+      vel_sweep: true
+      vel_step: 0.1
 
 # ══════════════════════════════════════════════════════════════
 # PHASE 1 — Flat, Bootstrap
@@ -454,6 +455,46 @@ phases:
           min_iterations: 4000
           reward_decline_pct: 35.0
 
+      - id: p3b_fine_symmetry
+        name: "P3b Fine + Symmetry"
+        max_iterations: 5000
+        env:
+          terrain_generator:
+            sub_terrains:
+              flat:
+                type: MeshPlaneTerrainCfg
+                proportion: 0.7
+              random_grid:
+                type: RandomGridTerrainCfg
+                proportion: 0.3
+                difficulty_range: [0.0, 0.35]
+        ppo:
+          learning_rate: 1.0e-4
+          entropy_coef: 0.01
+        rewards:
+          track_lin_vel_xy: 2.0
+          track_ang_vel_z: 1.0
+          alive: 0.15
+          base_height: -8.0
+          flat_orientation_l2: -5.0
+          action_rate_l1: -0.05
+          base_linear_velocity: -2.0
+          base_angular_velocity: -0.05
+          joint_vel: -0.001
+          joint_acc: -2.5e-7
+          energy: -2e-5
+          dof_pos_limits: -5.0
+          joint_deviation_legs: -0.7
+          joint_mirror: -0.5
+          feet_contact_number: 0.5
+          feet_slide: 0.0
+          feet_clearance: 1.0
+          stand_still: -3.5
+          undesired_contacts: -1.5
+        monitor:
+          action_rate_threshold: -1.0
+          min_iterations: 2000
+
   # ══════════════════════════════════════════════════════════════
   # PHASE 4 — Rough Terrain
   # ══════════════════════════════════════════════════════════════
@@ -474,34 +515,34 @@ phases:
         sub_terrains:
           flat:
             type: MeshPlaneTerrainCfg
-            proportion: 0.3
+            proportion: 0.5
           random_grid:
             type: RandomGridTerrainCfg
-            proportion: 0.3
-            difficulty_range: [0.0, 0.5]
+            proportion: 0.25
+            difficulty_range: [0.0, 0.45]
           stairs:
             type: StairsTerrainCfg
-            proportion: 0.2
-            difficulty_range: [0.0, 0.4]
+            proportion: 0.10
+            difficulty_range: [0.0, 0.25]
           gap:
             type: GapTerrainCfg
-            proportion: 0.1
-            difficulty_range: [0.0, 0.3]
+            proportion: 0.05
+            difficulty_range: [0.0, 0.15]
           boxes:
             type: BoxesTerrainCfg
-            proportion: 0.1
-            difficulty_range: [0.0, 0.3]
+            proportion: 0.05
+            difficulty_range: [0.0, 0.15]
     sub_phases:
       - id: p4_coarse
         name: "P4 Coarse"
         max_iterations: 25000
         ppo:
-          learning_rate: 1.0e-4
+          learning_rate: 3.0e-4
           entropy_coef: 0.012
         rewards:
-          track_lin_vel_xy: 1.5
-          track_ang_vel_z: 0.75
-          alive: 0.3
+          track_lin_vel_xy: 1.8
+          track_ang_vel_z: 0.85
+          alive: 0.2
           base_height: -8.0
           flat_orientation_l2: -5.0
           action_rate_l1: -0.04
@@ -509,17 +550,18 @@ phases:
           base_angular_velocity: -0.05
           joint_vel: -0.001
           joint_acc: -2.5e-7
-          energy: -3e-5
+          energy: -2e-5
           dof_pos_limits: -5.0
           joint_deviation_legs: -0.7
           joint_deviation_hip_knee: -1.0
+          joint_mirror: -0.2
           feet_contact_number: 0.5
-          feet_slide: -0.3
+          feet_slide: -0.1
           feet_clearance: 1.0
-          stand_still: 0.0
+          stand_still: -1.5
           undesired_contacts: -1.5
         monitor:
-          action_rate_threshold: -1.5
+          action_rate_threshold: -1.2
           min_iterations: 5000
           reward_decline_pct: 35.0
 
@@ -531,46 +573,47 @@ phases:
             sub_terrains:
               flat:
                 type: MeshPlaneTerrainCfg
-                proportion: 0.3
+                proportion: 0.4
               random_grid:
                 type: RandomGridTerrainCfg
-                proportion: 0.3
-                difficulty_range: [0.0, 0.7]
+                proportion: 0.25
+                difficulty_range: [0.0, 0.55]
               stairs:
                 type: StairsTerrainCfg
-                proportion: 0.2
-                difficulty_range: [0.0, 0.6]
+                proportion: 0.15
+                difficulty_range: [0.0, 0.40]
               gap:
                 type: GapTerrainCfg
-                proportion: 0.1
-                difficulty_range: [0.0, 0.5]
+                proportion: 0.10
+                difficulty_range: [0.0, 0.25]
               boxes:
                 type: BoxesTerrainCfg
-                proportion: 0.1
-                difficulty_range: [0.0, 0.5]
+                proportion: 0.10
+                difficulty_range: [0.0, 0.25]
         ppo:
-          learning_rate: 8.0e-5
+          learning_rate: 3.0e-4
           entropy_coef: 0.008
         rewards:
           track_lin_vel_xy: 2.0
           track_ang_vel_z: 1.0
-          alive: 0.15
+          alive: 0.18
           base_height: -10.0
           flat_orientation_l2: -7.0
-          action_rate_l1: -0.06
+          action_rate_l1: -0.05
           base_linear_velocity: -2.0
           base_angular_velocity: -0.05
           joint_vel: -0.001
           joint_acc: -2.5e-7
-          energy: -5e-5
+          energy: -3e-5
           dof_pos_limits: -5.0
           joint_deviation_legs: -0.7
           joint_deviation_hip_knee: -1.0
+          joint_mirror: -0.3
           feet_contact_number: 0.5
-          feet_slide: -0.4
+          feet_slide: -0.2
           feet_clearance: 1.0
-          stand_still: -3.5
-          undesired_contacts: -2.0
+          stand_still: -2.5
+          undesired_contacts: -1.5
         monitor:
           action_rate_threshold: -1.5
           min_iterations: 5000
@@ -618,6 +661,28 @@ phases:
       - id: p5_coarse
         name: "P5 Coarse"
         max_iterations: 30000
+        env:
+          terrain_generator:
+            sub_terrains:
+              flat:
+                type: MeshPlaneTerrainCfg
+                proportion: 0.3
+              random_grid:
+                type: RandomGridTerrainCfg
+                proportion: 0.2
+                difficulty_range: [0.0, 0.70]
+              stairs:
+                type: StairsTerrainCfg
+                proportion: 0.2
+                difficulty_range: [0.0, 0.55]
+              gap:
+                type: GapTerrainCfg
+                proportion: 0.1
+                difficulty_range: [0.0, 0.40]
+              boxes:
+                type: BoxesTerrainCfg
+                proportion: 0.1
+                difficulty_range: [0.0, 0.40]
         ppo:
           learning_rate: 1.0e-4
           entropy_coef: 0.01
@@ -632,14 +697,15 @@ phases:
           base_angular_velocity: -0.05
           joint_vel: -0.002
           joint_acc: -1.0e-6
-          energy: -5e-5
+          energy: -4e-5
           dof_pos_limits: -5.0
           joint_deviation_legs: -0.7
           joint_deviation_hip_knee: -1.0
+          joint_mirror: -0.3
           feet_contact_number: 0.5
-          feet_slide: -0.4
+          feet_slide: -0.3
           feet_clearance: 1.0
-          stand_still: 0.0
+          stand_still: -1.0
           undesired_contacts: -2.0
         monitor:
           action_rate_threshold: -1.5

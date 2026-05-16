@@ -371,6 +371,7 @@ class PhaseOrchestrator:
 
         # 5) Launch training
         run_name = sp_id
+        launch_time = time.time()
         self._proc = self._launcher.launch(
             run_name=run_name,
             max_iterations=sp.max_iterations,
@@ -389,7 +390,7 @@ class PhaseOrchestrator:
         run_dir = None
         for attempt in range(max_attempts):
             time.sleep(30)
-            run_dir = self._find_latest_run_dir(run_name)
+            run_dir = self._find_latest_run_dir(run_name, min_ctime=launch_time)
             if run_dir is not None:
                 break
             logger.info("Run directory not found (attempt %d/%d)...", attempt + 1, max_attempts)
@@ -808,8 +809,23 @@ class PhaseOrchestrator:
             logger.warning("MJCF not found at %s — skipping MuJoCo recording", mjcf_path)
             return
 
-        num_steps = mujoco_cfg.get("num_steps", 500)
-        vel_x = mujoco_cfg.get("vel_x", 0.5)
+        num_steps = mujoco_cfg.get("num_steps", 1000)
+
+        # Velocity sweep: read command ranges from training plan
+        sp = self._phase_mgr.get_sub_phase(sp_id)
+        vel_min = 0.0
+        vel_max = 1.0
+        vel_step = 0.1
+        use_sweep = True
+        if sp and sp.env.get("commands", {}).get("ranges", {}).get("lin_vel_x"):
+            vel_range = sp.env["commands"]["ranges"]["lin_vel_x"]
+            vel_min = max(0.0, vel_range[0])  # start from 0 or min (skip negative)
+            vel_max = vel_range[1]
+            vel_step = round((vel_max - vel_min) / 10, 2)  # ~10 steps
+            if vel_step < 0.05:
+                vel_step = 0.05
+            logger.info("MuJoCo vel sweep for '%s': %.1f -> %.1f m/s (step=%.2f)",
+                        sp_id, vel_min, vel_max, vel_step)
 
         logger.info("Recording MuJoCo video for '%s'...", sp_id)
         try:
@@ -819,8 +835,17 @@ class PhaseOrchestrator:
                 f"--policy={jit_policy_path}",
                 f"--record={video_file}",
                 f"--num_steps={num_steps}",
-                f"--vel_x={vel_x}",
             ]
+            if use_sweep:
+                cmd += [
+                    "--vel_sweep",
+                    f"--vel_min={vel_min}",
+                    f"--vel_max={vel_max}",
+                    f"--vel_step={vel_step}",
+                ]
+            else:
+                vel_x = mujoco_cfg.get("vel_x", 0.5)
+                cmd.append(f"--vel_x={vel_x}")
             result = subprocess.run(
                 cmd,
                 cwd=str(self._project_root),
@@ -1220,7 +1245,7 @@ class PhaseOrchestrator:
         phase = self._phase_mgr.get_phase_for_sub_phase(sp_id)
         return phase.id if phase else ""
 
-    def _find_latest_run_dir(self, run_name: str) -> Optional[str]:
+    def _find_latest_run_dir(self, run_name: str, min_ctime: float = 0.0) -> Optional[str]:
         if not self._log_root.exists():
             return None
 
@@ -1228,6 +1253,7 @@ class PhaseOrchestrator:
         candidates = [
             d for d in self._log_root.iterdir()
             if d.is_dir() and not d.name.startswith(".") and d.name.endswith(suffix)
+            and d.stat().st_ctime >= min_ctime
         ]
         if not candidates:
             return None
