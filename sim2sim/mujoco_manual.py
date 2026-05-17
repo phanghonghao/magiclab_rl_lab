@@ -23,6 +23,11 @@ Usage:
         --mjcf ../magicbot-z1_description/mjcf/MAGICBOTZ1.xml \
         --policy policy.pt --deploy_cfg deploy.yaml \
         --terrain p3b --record /tmp/output.mp4
+
+    # Manual joint control (no policy):
+    python sim2sim/mujoco_manual.py \
+        --mjcf ../magicbot-z1_description/mjcf/MAGICBOTZ1.xml \
+        --manual --keyboard
 """
 
 import argparse
@@ -57,7 +62,8 @@ def generate_terrain_data(terrain_type="p3b", seed=42, difficulty=1.0):
         terrain_type: "p3" or "p3b"
         seed: Random seed for reproducibility
         difficulty: Scale factor for terrain height (0-1). At 1.0, full height.
-                    For the current p3_coarse curriculum, use about 0.625.
+                    In Isaac Lab, actual difficulty = terrain_level / (num_rows - 1).
+                    For p3_coarse with level ~5/9, difficulty ≈ 0.625.
 
     Returns: (nrow, ncol, half_x, half_y, max_elev, hmap)
     """
@@ -68,7 +74,7 @@ def generate_terrain_data(terrain_type="p3b", seed=42, difficulty=1.0):
         # p3: gentle terrain — flat 70% + random_grid 30% (height 0-0.4m)
         TERRAIN_L = 24.0
         TERRAIN_W = 8.0
-        MAX_ELEV = 0.4
+        MAX_ELEV = 0.4  # match IsaacSim grid_height_range=(0.0, 0.4)
     elif terrain_type == "p3b":
         # p3b: intermediate terrain — flat 50% + random_grid 30% + stairs 10% + boxes 10%
         TERRAIN_L = 24.0
@@ -144,6 +150,7 @@ def generate_terrain_data(terrain_type="p3b", seed=42, difficulty=1.0):
             padded[2:, :-2] + padded[2:, 1:-1] + padded[2:, 2:]
         ) / 9.0
 
+    # Apply difficulty scaling (match Isaac Lab curriculum level)
     if difficulty < 1.0:
         hmap *= difficulty
         effective_max = MAX_ELEV * difficulty
@@ -162,9 +169,7 @@ def load_model_with_terrain(mjcf_path, terrain_type, difficulty=1.0):
     """Load MuJoCo model with terrain hfield injected via Python API."""
     import mujoco
 
-    nrow, ncol, half_x, half_y, max_elev, terrain_data = generate_terrain_data(
-        terrain_type, difficulty=difficulty
-    )
+    nrow, ncol, half_x, half_y, max_elev, terrain_data = generate_terrain_data(terrain_type, difficulty=difficulty)
 
     # Read original XML
     with open(mjcf_path, 'r') as f:
@@ -194,10 +199,11 @@ def load_model_with_terrain(mjcf_path, terrain_type, difficulty=1.0):
 def parse_args():
     parser = argparse.ArgumentParser(description="MuJoCo sim-to-sim deployment for MagicBot Z1")
     parser.add_argument("--mjcf", type=str, required=True, help="Path to MAGICBOTZ1.xml")
-    parser.add_argument("--policy", type=str, required=True, help="Path to policy file (.pt or .onnx)")
+    parser.add_argument("--policy", type=str, default=None, help="Path to policy file (.pt or .onnx)")
     parser.add_argument("--deploy_cfg", type=str, default=None, help="Path to deploy.yaml (optional)")
+    parser.add_argument("--manual", action="store_true", help="Manual joint control mode (no policy)")
     parser.add_argument("--onnx", action="store_true", help="Use ONNX model instead of JIT")
-    parser.add_argument("--vel_x", type=float, default=0.5, help="Forward velocity command (m/s)")
+    parser.add_argument("--vel_x", type=float, default=0.3, help="Forward velocity command (m/s)")
     parser.add_argument("--vel_y", type=float, default=0.0, help="Lateral velocity command (m/s)")
     parser.add_argument("--vel_yaw", type=float, default=0.0, help="Yaw velocity command (rad/s)")
     parser.add_argument("--keyboard", action="store_true", help="Use keyboard for velocity commands")
@@ -208,6 +214,8 @@ def parse_args():
     parser.add_argument("--terrain", type=str, default=None, help="Terrain type: 'p3' or 'p3b'")
     parser.add_argument("--phase", type=str, default=None,
                         help="Phase ID (p1/p2/p3/p3b/p4) — auto-selects terrain. Explicit --terrain takes priority.")
+    parser.add_argument("--flat", action="store_true",
+                        help="Force flat ground (overrides terrain from --phase)")
     parser.add_argument("--show_viewer", action="store_true", default=True, help="Show MuJoCo viewer")
     parser.add_argument("--csv", type=str, default=None, nargs='?', const='auto',
                         help="Log simulation data to CSV. --csv alone auto-names; --csv path.csv uses custom path")
@@ -328,16 +336,37 @@ class KeyboardController:
         69: 'e',         # GLFW_KEY_E
         32: 'space',     # GLFW_KEY_SPACE
         256: 'esc',      # GLFW_KEY_ESCAPE
+        91: 'lbracket',  # GLFW_KEY_LEFT_BRACKET  [
+        93: 'rbracket',  # GLFW_KEY_RIGHT_BRACKET ]
+        87: 'w',         # GLFW_KEY_W
+        83: 's',         # GLFW_KEY_S
+        258: 'tab',      # GLFW_KEY_TAB
     }
 
-    def __init__(self, initial_vel=None):
+    # Joint short names for display
+    JOINT_NAMES = [
+        "hip_p_l", "hip_r_l", "hip_y_l", "knee_p_l", "ank_p_l", "ank_r_l",
+        "hip_p_r", "hip_r_r", "hip_y_r", "knee_p_r", "ank_p_r", "ank_r_r",
+    ]
+
+    def __init__(self, initial_vel=None, manual_mode=False, default_joint_pos=None):
+        self.manual_mode = manual_mode
         self.vel_cmd = np.array(initial_vel, dtype=np.float64) if initial_vel is not None else np.array([0.0, 0.0, 0.0])
         self.lin_vel_range = (-0.5, 1.0)
         self.ang_vel_range = (-0.5, 0.5)
         self.vel_step = 0.1
         self.running = True
         self.viewer_active = False  # set True when MuJoCo viewer callback is registered
-        print("Keyboard control: Up/Down=forward/back, Left/Right=turn, Q/E=lateral, Space=stop, Esc=quit")
+        self.panel_visible = True
+
+        # Manual mode state
+        if manual_mode:
+            self.selected_joint = 0
+            self.joint_targets = (default_joint_pos if default_joint_pos is not None else DEFAULT_JOINT_POS).copy()
+            print("[MANUAL] Direct joint control mode (no policy)")
+            print("  [/]=select joint  Up/Down=±0.1  W/S=±0.02  Space=reset joints  R=reset robot  Tab=panel  Esc=quit")
+        else:
+            print("Keyboard control: Up/Down=forward/back, Left/Right=turn, Q/E=lateral, Space=stop, Esc=quit")
 
     def handle_viewer_key(self, keycode):
         """Callback for MuJoCo viewer key presses (GLFW keycodes)."""
@@ -362,15 +391,26 @@ class KeyboardController:
 
     def _apply_msvcrt(self, key):
         """Convert msvcrt byte to key name and apply."""
-        mapping = {b'w': 'up', b's': 'down', b'a': 'left', b'd': 'right',
+        mapping = {b'w': 'w' if self.manual_mode else 'up',
+                   b's': 's' if self.manual_mode else 'down',
+                   b'a': 'left', b'd': 'right',
                    b'q': 'q', b'e': 'e', b' ': 'space', b'\x1b': 'esc',
-                   b'H': 'up', b'P': 'down', b'K': 'left', b'M': 'right'}
+                   b'r': 'r',
+                   b'H': 'up', b'P': 'down', b'K': 'left', b'M': 'right',
+                   b'[': 'lbracket', b']': 'rbracket'}
         key_name = mapping.get(key)
         if key_name:
             self._apply_key(key_name)
 
     def _apply_key(self, key):
         """Shared key action handler."""
+        if self.manual_mode:
+            self._apply_key_manual(key)
+        else:
+            self._apply_key_policy(key)
+
+    def _apply_key_policy(self, key):
+        """Key handler for policy (velocity command) mode."""
         if key == 'up':
             self.vel_cmd[0] = min(self.vel_cmd[0] + self.vel_step, self.lin_vel_range[1])
             self._print_vel()
@@ -395,11 +435,52 @@ class KeyboardController:
         elif key == 'esc':
             self.running = False
 
+    def _apply_key_manual(self, key):
+        """Key handler for manual joint control mode."""
+        if key == 'lbracket':
+            self.selected_joint = (self.selected_joint - 1) % 12
+            self._print_manual_status()
+        elif key == 'rbracket':
+            self.selected_joint = (self.selected_joint + 1) % 12
+            self._print_manual_status()
+        elif key == 'up':
+            self.joint_targets[self.selected_joint] += 0.1
+            self._print_manual_status()
+        elif key == 'down':
+            self.joint_targets[self.selected_joint] -= 0.1
+            self._print_manual_status()
+        elif key == 'w':
+            self.joint_targets[self.selected_joint] += 0.02
+            self._print_manual_status()
+        elif key == 's':
+            self.joint_targets[self.selected_joint] -= 0.02
+            self._print_manual_status()
+        elif key == 'space':
+            self.joint_targets[:] = DEFAULT_JOINT_POS
+            print("  [MANUAL] All joints reset to default")
+        elif key == 'r':
+            self._reset_requested = True
+            print("  [MANUAL] Robot reset requested")
+        elif key == 'tab':
+            self.panel_visible = not self.panel_visible
+            state = "shown" if self.panel_visible else "hidden"
+            print(f"  [MANUAL] Left panel: {state}")
+        elif key == 'esc':
+            self.running = False
+
     def _print_vel(self):
         print(f"  [CMD] vel=({self.vel_cmd[0]:.1f}, {self.vel_cmd[1]:.1f}, {self.vel_cmd[2]:.1f})")
 
     def get_command(self):
         return self.vel_cmd.copy()
+
+    def get_joint_targets(self):
+        """Return current manual joint targets (manual mode only)."""
+        return self.joint_targets.copy()
+
+    def _print_manual_status(self):
+        j = self.selected_joint
+        print(f"  [{j:2d}] {self.JOINT_NAMES[j]:10s} target={self.joint_targets[j]:+.3f} rad")
 
 
 def quat_to_rot_matrix(quat_wxyz):
@@ -423,10 +504,11 @@ def compute_gait_phase(sim_time, vel_cmd, period=GAIT_PERIOD):
 
 
 class MuJoCoDeploy:
-    def __init__(self, mjcf_path, policy_runner, deploy_cfg=None, vel_cmd=None, terrain=None, terrain_difficulty=1.0):
+    def __init__(self, mjcf_path, policy_runner=None, deploy_cfg=None, vel_cmd=None, terrain=None, terrain_difficulty=1.0):
         import mujoco
 
         self.policy = policy_runner
+        self.manual_mode = policy_runner is None
         self.vel_cmd = np.array(vel_cmd) if vel_cmd is not None else np.array([0.5, 0.0, 0.0])
 
         # PD gains: load from deploy.yaml (training uses IdealPDActuator = explicit PD,
@@ -441,6 +523,8 @@ class MuJoCoDeploy:
             self.action_scale = np.array(action_cfg.get("scale", [ACTION_SCALE] * 12))
             self.action_offset = np.array(action_cfg.get("offset", DEFAULT_JOINT_POS.tolist()))
         else:
+            self.kp = DEFAULT_KP.copy()
+            self.kd = DEFAULT_KD.copy()
             self.action_scale = np.full(12, ACTION_SCALE)
             self.action_offset = DEFAULT_JOINT_POS.copy()
 
@@ -490,6 +574,7 @@ class MuJoCoDeploy:
         self.effort_limits = np.array([120, 120, 120, 120, 50, 50,
                                        120, 120, 120, 120, 50, 50], dtype=np.float64)
 
+        self._initial_vel_cmd = self.vel_cmd.copy()
         self.obs_buffer = ObservationBuffer()
         self.last_action = np.zeros(12)
         self.last_torques = np.zeros(12)
@@ -498,6 +583,7 @@ class MuJoCoDeploy:
 
     def reset(self):
         import mujoco
+        self.vel_cmd[:] = self._initial_vel_cmd
         mujoco.mj_resetData(self.model, self.data)
         self.data.qpos[2] = 0.69
         self.data.qpos[3] = 1.0
@@ -556,6 +642,7 @@ class MuJoCoDeploy:
         import mujoco
         obs_history = self.obs_buffer.get()
         action = self.policy.predict(obs_history)
+        action = np.clip(action, -100.0, 100.0)
         self.last_action = action.copy()
         target_pos = self.action_offset + action * self.action_scale
         for _ in range(DECIMATION):
@@ -576,6 +663,51 @@ class MuJoCoDeploy:
         self.obs_buffer.append(new_obs)
         return False
 
+    def step_manual(self, joint_targets):
+        """PD control step using externally provided joint targets (manual mode)."""
+        import mujoco
+        for _ in range(DECIMATION):
+            current_pos = np.array([self.data.qpos[a] for a in self.leg_qpos_addr])
+            current_vel = np.array([self.data.qvel[a] for a in self.leg_dof_addr])
+            torques = np.clip(
+                self.kp * (joint_targets - current_pos) - self.kd * current_vel,
+                -self.effort_limits, self.effort_limits
+            )
+            for i, act_id in enumerate(self.leg_actuator_ids):
+                self.data.ctrl[act_id] = torques[i]
+            mujoco.mj_step(self.model, self.data)
+        self.last_torques = torques.copy()
+        self.last_action = np.zeros(12)
+        self.sim_time += CONTROL_DT
+        if self.data.qpos[2] < 0.3 or (self.data.qpos[4]**2 + self.data.qpos[5]**2 + self.data.qpos[6]**2) > 0.5:
+            return True
+        return False
+
+    def reset_manual(self):
+        """Reset robot pose for manual mode with PD warmup to stabilize standing."""
+        import mujoco
+        mujoco.mj_resetData(self.model, self.data)
+        self.data.qpos[2] = 0.69
+        self.data.qpos[3] = 1.0
+        self.data.qpos[4:7] = 0.0
+        for i, addr in enumerate(self.leg_qpos_addr):
+            self.data.qpos[addr] = self.default_joint_pos[i]
+        mujoco.mj_forward(self.model, self.data)
+        self.last_action = np.zeros(12)
+        self.last_torques = np.zeros(12)
+        self.sim_time = 0.0
+        # PD warmup — let the robot settle before returning control to user
+        for _ in range(50):
+            tgt = self.default_joint_pos
+            for _ in range(DECIMATION):
+                cp = np.array([self.data.qpos[a] for a in self.leg_qpos_addr])
+                cv = np.array([self.data.qvel[a] for a in self.leg_dof_addr])
+                torques = np.clip(self.kp * (tgt - cp) - self.kd * cv, -self.effort_limits, self.effort_limits)
+                for i, act_id in enumerate(self.leg_actuator_ids):
+                    self.data.ctrl[act_id] = torques[i]
+                mujoco.mj_step(self.model, self.data)
+            self.sim_time += CONTROL_DT
+
     def get_robot_state(self):
         pos = self.data.qpos[:3].copy()
         return {"x": pos[0], "y": pos[1], "z": pos[2], "time": self.sim_time}
@@ -584,49 +716,59 @@ class MuJoCoDeploy:
 def main():
     args = parse_args()
 
+    if not args.manual and args.policy is None:
+        print("[ERROR] --policy is required when not using --manual mode")
+        return
+
     deploy_cfg = None
     if args.deploy_cfg:
         with open(args.deploy_cfg, "r") as f:
             deploy_cfg = yaml.unsafe_load(f)
         print(f"[INFO] Loaded deploy config from {args.deploy_cfg}")
 
-    policy = PolicyRunner(args.policy, use_onnx=args.onnx)
-    print(f"[INFO] Loaded policy from {args.policy} (ONNX={args.onnx})")
+    # Policy loading (skip in manual mode)
+    policy = None
+    if not args.manual:
+        policy = PolicyRunner(args.policy, use_onnx=args.onnx)
+        print(f"[INFO] Loaded policy from {args.policy} (ONNX={args.onnx})")
 
     vel_cmd = [args.vel_x, args.vel_y, args.vel_yaw]
     kb_controller = None
-    if args.keyboard:
-        kb_controller = KeyboardController(initial_vel=vel_cmd)
+    if args.keyboard or args.manual:
+        kb_controller = KeyboardController(
+            initial_vel=vel_cmd,
+            manual_mode=args.manual,
+            default_joint_pos=DEFAULT_JOINT_POS,
+        )
 
-    # Phase-aware terrain selection: --terrain takes priority over --phase
-    terrain = args.terrain
-    if terrain is None and args.phase is not None:
-        terrain = PHASE_TERRAIN.get(args.phase)
-        if terrain is None:
-            print(f"[INFO] Phase '{args.phase}' -> flat ground (no terrain needed)")
-        else:
-            print(f"[INFO] Phase '{args.phase}' -> auto-selected terrain '{terrain}'")
-    elif terrain is not None and args.phase is not None:
-        print(f"[INFO] Phase '{args.phase}' overridden by explicit --terrain '{terrain}'")
+    # Phase-aware terrain selection: --flat > --terrain > --phase
+    if args.flat:
+        terrain = None
+        if args.phase is not None:
+            print(f"[INFO] --flat forced: ignoring terrain from phase '{args.phase}'")
+    else:
+        terrain = args.terrain
+        if terrain is None and args.phase is not None:
+            terrain = PHASE_TERRAIN.get(args.phase)
+            if terrain is None:
+                print(f"[INFO] Phase '{args.phase}' -> flat ground (no terrain needed)")
+            else:
+                print(f"[INFO] Phase '{args.phase}' -> auto-selected terrain '{terrain}'")
+        elif terrain is not None and args.phase is not None:
+            print(f"[INFO] Phase '{args.phase}' overridden by explicit --terrain '{terrain}'")
 
     terrain_diff = args.terrain_difficulty if args.terrain_difficulty is not None else 1.0
     if terrain == "p3" and args.terrain_difficulty is None:
         print("[WARN] --terrain_difficulty not set; using full p3 height (1.0). "
               "For the current p3_coarse run, ~0.625 is closer to the trained curriculum.")
-
-    env = MuJoCoDeploy(
-        args.mjcf,
-        policy,
-        deploy_cfg=deploy_cfg,
-        vel_cmd=vel_cmd,
-        terrain=terrain,
-        terrain_difficulty=terrain_diff,
-    )
+    env = MuJoCoDeploy(args.mjcf, policy, deploy_cfg=deploy_cfg, vel_cmd=vel_cmd, terrain=terrain,
+                        terrain_difficulty=terrain_diff)
     print(f"[INFO] MuJoCo model loaded from {args.mjcf}" +
           (f" with terrain={terrain}" if terrain else " (flat ground)"))
     print(f"[INFO] Control frequency: {1.0/CONTROL_DT:.0f}Hz, Physics: {1.0/PHYSICS_DT:.0f}Hz")
-    print(f"[INFO] Observation: {OBS_DIM_TOTAL}d ({OBS_DIM_PER_FRAME}d x {HISTORY_LENGTH} frames)")
-    print(f"[INFO] Velocity command: {vel_cmd}")
+    if not args.manual:
+        print(f"[INFO] Observation: {OBS_DIM_TOTAL}d ({OBS_DIM_PER_FRAME}d x {HISTORY_LENGTH} frames)")
+        print(f"[INFO] Velocity command: {vel_cmd}")
 
     # CSV data logger
     csv_file = None
@@ -642,7 +784,7 @@ def main():
             import datetime
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             phase_tag = args.phase or "test"
-            csv_path = f"logs/p/{phase_tag}/{phase_tag}_{timestamp}.csv"
+            csv_path = f"logs/p/{phase_tag}/{timestamp}/{phase_tag}.csv"
         else:
             csv_path = args.csv
         log_dir = os.path.dirname(csv_path)
@@ -695,14 +837,36 @@ def main():
         for step in range(args.num_steps):
             if kb_controller:
                 kb_controller.update()
-                env.vel_cmd = kb_controller.get_command()
                 if not kb_controller.running:
                     break
 
-            fell = env.step()
-            if fell:
-                env.reset()
-                fall_count += 1
+                if args.manual:
+                    # Check for reset request
+                    if getattr(kb_controller, '_reset_requested', False):
+                        kb_controller._reset_requested = False
+                        env.reset_manual()
+                        kb_controller.joint_targets[:] = DEFAULT_JOINT_POS
+                        fall_count = 0
+                        continue
+
+                    joint_targets = kb_controller.get_joint_targets()
+                    fell = env.step_manual(joint_targets)
+                else:
+                    env.vel_cmd = kb_controller.get_command()
+                    fell = env.step()
+
+                if fell:
+                    if args.manual:
+                        env.reset_manual()
+                        kb_controller.joint_targets[:] = DEFAULT_JOINT_POS
+                    else:
+                        env.reset()
+                    fall_count += 1
+            else:
+                fell = env.step()
+                if fell:
+                    env.reset()
+                    fall_count += 1
 
             if csv_writer:
                 state = env.get_robot_state()
@@ -730,10 +894,18 @@ def main():
 
             if step % 500 == 0:
                 state = env.get_robot_state()
-                print(f"  Step {step:5d} | t={state['time']:.1f}s | "
-                      f"pos=({state['x']:.2f}, {state['y']:.2f}, {state['z']:.2f}) | "
-                      f"falls={fall_count}")
-
+                if args.manual:
+                    j = kb_controller.selected_joint if kb_controller else 0
+                    print(f"  Step {step:5d} | t={state['time']:.1f}s | "
+                          f"pos=({state['x']:.2f}, {state['y']:.2f}, {state['z']:.2f}) | "
+                          f"[{j}] {KeyboardController.JOINT_NAMES[j]}={kb_controller.joint_targets[j]:+.3f} | "
+                          f"falls={fall_count}")
+                else:
+                    vel_cmd_str = (f"cmd=({env.vel_cmd[0]:.1f}, {env.vel_cmd[1]:.1f}, {env.vel_cmd[2]:.1f})"
+                                   if kb_controller else "")
+                    print(f"  Step {step:5d} | t={state['time']:.1f}s | "
+                          f"pos=({state['x']:.2f}, {state['y']:.2f}, {state['z']:.2f}) | "
+                          f"{vel_cmd_str} | falls={fall_count}")
             if viewer and not args.record:
                 time.sleep(max(0, CONTROL_DT - 0.001))
 
