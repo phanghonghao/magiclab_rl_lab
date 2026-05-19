@@ -64,6 +64,7 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 from automation.config_generator import generate_env_config, _ACTIVE_CFG_REL
+from automation.bestmodel_phase_sync import sync_bestmodel_phase_json
 from automation.embedded_monitor import EmbeddedMonitor
 from automation.phase_manager import PhaseManager, SubPhaseConfig
 from automation.ppo_override import generate_ppo_override
@@ -99,7 +100,8 @@ class PhaseOrchestrator:
 
         # Components
         self._phase_mgr = PhaseManager(plan_path)
-        self._state_store = StateStore(self._project_root / state_path)
+        self._state_path = Path(state_path)
+        self._state_store = StateStore(self._project_root / self._state_path)
         self._launcher = TrainingLauncher(
             train_script=str(self._project_root / "scripts" / "rsl_rl" / "train.py"),
             multigpu_script=str(self._project_root / "scripts" / "rsl_rl" / "train_multigpu.py"),
@@ -125,6 +127,11 @@ class PhaseOrchestrator:
             self._start_id = start_from
         else:
             self._start_id = self._phase_mgr.get_start_sub_phase_id()
+
+    def _persist_state(self) -> None:
+        """Save orchestrator state and refresh docs/tracking/bestmodel_phase.json."""
+        self._state_store.save(self._state)
+        self._sync_bestmodel_phase_tracking()
 
     # ── Public entry ────────────────────────────────────────────── #
 
@@ -182,11 +189,11 @@ class PhaseOrchestrator:
                     logger.error("Unknown status: %s", status)
                     break
 
-                self._state_store.save(self._state)
+                self._persist_state()
                 time.sleep(self._poll_interval)
         except KeyboardInterrupt:
             logger.info("Interrupted — saving state and exiting")
-            self._state_store.save(self._state)
+            self._persist_state()
 
     # ── Sub-phase lifecycle ─────────────────────────────────────── #
 
@@ -338,7 +345,7 @@ class PhaseOrchestrator:
             current_stage_status="pending",
             started_at=datetime.now().isoformat(),
         )
-        self._state_store.save(self._state)
+        self._persist_state()
         logger.info("New orchestration run: plan='%s', start='%s'",
                      self._state.plan_name, self._start_id)
 
@@ -595,7 +602,7 @@ class PhaseOrchestrator:
             logger.info("=== ALL SUB-PHASES COMPLETE! ===")
             logger.info("Plan '%s' finished at %s",
                          self._state.plan_name, datetime.now().isoformat())
-            self._state_store.save(self._state)
+            self._persist_state()
             sys.exit(0)
 
         # Wait for Kit cleanup before starting next sub-phase to prevent
@@ -628,7 +635,7 @@ class PhaseOrchestrator:
             self._state.training_run_dir = None
         else:
             logger.error("Sub-phase '%s' failed after %d retries — stopping", sp_id, max_retries)
-            self._state_store.save(self._state)
+            self._persist_state()
             sys.exit(1)
 
     # ── Rollback helpers ────────────────────────────────────────── #
@@ -751,6 +758,9 @@ class PhaseOrchestrator:
         # 5) Generate plots
         if post_phase.get("enable_plots", True) and self._state.training_run_dir:
             self._generate_plots(sp_id, self._state.training_run_dir)
+
+        # 6) Refresh docs/tracking/bestmodel_phase.json on RTX
+        self._sync_bestmodel_phase_tracking()
 
     def _export_jit(self, sp_id: str, checkpoint: str) -> Optional[str]:
         """Export the best checkpoint as a JIT policy. Returns path to policy.pt or None."""
@@ -1087,7 +1097,7 @@ class PhaseOrchestrator:
             training_run_dir=run_dir,
             started_at=datetime.now().isoformat(),
         )
-        self._state_store.save(self._state)
+        self._persist_state()
 
         # Attach monitor
         self._resume_monitor()
@@ -1305,6 +1315,19 @@ class PhaseOrchestrator:
                 logging.FileHandler(log_dir / "phase_orchestrator.log", mode="a", encoding="utf-8"),
             ],
         )
+
+    def _sync_bestmodel_phase_tracking(self) -> None:
+        """Refresh docs/tracking/bestmodel_phase.json from current orchestrator state."""
+        try:
+            output_path = sync_bestmodel_phase_json(
+                project_root=self._project_root,
+                plan_path=self._phase_mgr._plan_path,
+                state_path=self._state_path,
+                output_rel="docs/tracking/bestmodel_phase.json",
+            )
+            logger.info("Tracking JSON updated: %s", output_path)
+        except Exception as exc:
+            logger.warning("Failed to update bestmodel_phase.json: %s", exc)
 
     # ── Dry run ─────────────────────────────────────────────────── #
 

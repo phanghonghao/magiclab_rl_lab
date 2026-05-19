@@ -219,8 +219,10 @@ class EmbeddedMonitor:
         """Return the :class:`Path` to the best model checkpoint, or *None*."""
         if self._state is None or not self._state.rewards:
             return None
-        ckpt = Path(self._state.run_dir) / f"model_{self._state.best_model_iter}.pt"
-        return ckpt if ckpt.exists() else None
+        return CheckpointAnalyzer.resolve_checkpoint(
+            self._state.run_dir,
+            self._state.best_model_iter,
+        )
 
     @property
     def state(self) -> Optional[RunState]:

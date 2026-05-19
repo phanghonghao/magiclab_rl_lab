@@ -191,6 +191,35 @@ class CheckpointAnalyzer:
         return int(ckpt_path.stem.split("_")[1])
 
     @staticmethod
+    def resolve_checkpoint(run_dir: str | Path, target_iter: int) -> Optional[Path]:
+        """Resolve a metric step to a real checkpoint file.
+
+        TensorBoard steps do not always line up with ``model_<iter>.pt`` names.
+        Prefer the latest checkpoint at or before ``target_iter`` so the saved
+        artifact never points to a future model that had not produced the metric
+        yet. Fall back to the earliest later checkpoint if needed.
+        """
+        ckpts = CheckpointAnalyzer.find_checkpoints(str(run_dir))
+        if not ckpts:
+            return None
+
+        target_iter = int(target_iter)
+        floor_match: Optional[Path] = None
+        ceil_match: Optional[Path] = None
+
+        for ckpt in ckpts:
+            ckpt_iter = CheckpointAnalyzer.get_iteration(ckpt)
+            if ckpt_iter == target_iter:
+                return ckpt
+            if ckpt_iter < target_iter:
+                floor_match = ckpt
+                continue
+            ceil_match = ckpt
+            break
+
+        return floor_match or ceil_match or ckpts[-1]
+
+    @staticmethod
     def extract_std(ckpt_path: Path) -> float:
         """Load checkpoint and return mean of the std vector.
 
@@ -509,7 +538,8 @@ class ReportGenerator:
 
     def print_alert(self, state: RunState) -> None:
         """Multi-line alert output."""
-        best_ckpt = f"model_{state.best_model_iter}.pt"
+        best_ckpt_path = CheckpointAnalyzer.resolve_checkpoint(state.run_dir, state.best_model_iter)
+        best_ckpt = best_ckpt_path.name if best_ckpt_path else f"model_{state.best_model_iter}.pt"
         lines = [
             "",
             "=" * 70,
@@ -540,6 +570,8 @@ class ReportGenerator:
             "peak_reward_iter": state.peak_reward_iter,
             "best_model_iter": state.best_model_iter,
             "best_model_reward": state.best_model_reward,
+            "best_checkpoint_file": None,
+            "best_checkpoint_path": None,
             "overfitting_detected": state.overfitting_detected,
             "overfitting_reason": state.overfitting_reason,
             "latest_metrics": {
@@ -555,6 +587,11 @@ class ReportGenerator:
             "std_values": {str(k): v for k, v in sorted(state.std_values.items())},
         }
 
+        best_ckpt_path = CheckpointAnalyzer.resolve_checkpoint(state.run_dir, state.best_model_iter)
+        if best_ckpt_path:
+            report["best_checkpoint_file"] = best_ckpt_path.name
+            report["best_checkpoint_path"] = str(best_ckpt_path)
+
         report_path = monitor_dir / "report.txt"
         with open(report_path, "w") as f:
             json.dump(report, f, indent=2, default=str)
@@ -564,18 +601,23 @@ class ReportGenerator:
         monitor_dir = Path(state.run_dir) / "monitor"
         monitor_dir.mkdir(exist_ok=True)
 
-        best_ckpt = f"model_{state.best_model_iter}.pt"
-        checkpoint_abs = str(Path(state.run_dir) / best_ckpt)
+        best_ckpt_path = CheckpointAnalyzer.resolve_checkpoint(state.run_dir, state.best_model_iter)
+        best_ckpt = best_ckpt_path.name if best_ckpt_path else f"model_{state.best_model_iter}.pt"
+        checkpoint_abs = str(best_ckpt_path) if best_ckpt_path else str(Path(state.run_dir) / best_ckpt)
 
         marker = {
             "detected_at": datetime.now().isoformat(),
             "reason": state.overfitting_reason,
             "best_model": best_ckpt,
             "best_iteration": state.best_model_iter,
+            "best_checkpoint_iteration": (
+                CheckpointAnalyzer.get_iteration(best_ckpt_path) if best_ckpt_path else None
+            ),
             "best_reward": state.best_model_reward,
             "peak_reward": state.peak_reward,
             "peak_reward_iter": state.peak_reward_iter,
             "current_reward": state.rewards[-1][1] if state.rewards else 0,
+            "checkpoint_path": checkpoint_abs,
             "scp_commands": self._scp_rtx_to_local(state),
             "spark_play_command": self._spark_play_cmd(state),
         }
@@ -589,7 +631,8 @@ class ReportGenerator:
     # -- Command generators -------------------------------------------------- #
 
     def _export_commands(self, state: RunState) -> list[str]:
-        best_ckpt = Path(state.run_dir) / f"model_{state.best_model_iter}.pt"
+        best_ckpt = CheckpointAnalyzer.resolve_checkpoint(state.run_dir, state.best_model_iter)
+        best_ckpt = best_ckpt or (Path(state.run_dir) / f"model_{state.best_model_iter}.pt")
         return [
             "  Export:",
             f"    python {self.cfg.export_script} --checkpoint {best_ckpt} --onnx",
@@ -1031,7 +1074,9 @@ def run_continuous(cfg: MonitorConfig) -> None:
 
 def _auto_export_best(state: RunState, cfg: MonitorConfig) -> None:
     """Call export_jit.py for the best model checkpoint."""
-    best_ckpt = Path(state.run_dir) / f"model_{state.best_model_iter}.pt"
+    best_ckpt = CheckpointAnalyzer.resolve_checkpoint(state.run_dir, state.best_model_iter)
+    if best_ckpt is None:
+        best_ckpt = Path(state.run_dir) / f"model_{state.best_model_iter}.pt"
     if not best_ckpt.exists():
         print(f"[WARN] Best model checkpoint not found: {best_ckpt}")
         return
@@ -1160,8 +1205,9 @@ def _write_best_models_json(results: list[RunState], cfg: MonitorConfig) -> None
                 version = version.replace("z1_locomotion_", "")
                 break
 
-        best_ckpt = f"model_{state.best_model_iter}.pt"
-        checkpoint_path = str(Path(state.run_dir) / best_ckpt)
+        best_ckpt_path = CheckpointAnalyzer.resolve_checkpoint(state.run_dir, state.best_model_iter)
+        best_ckpt = best_ckpt_path.name if best_ckpt_path else f"model_{state.best_model_iter}.pt"
+        checkpoint_path = str(best_ckpt_path) if best_ckpt_path else str(Path(state.run_dir) / best_ckpt)
 
         entries.append({
             "version": version,
@@ -1173,6 +1219,9 @@ def _write_best_models_json(results: list[RunState], cfg: MonitorConfig) -> None
             "peak_reward": round(state.peak_reward, 2),
             "peak_reward_iter": state.peak_reward_iter,
             "best_model_iteration": state.best_model_iter,
+            "best_checkpoint_iteration": (
+                CheckpointAnalyzer.get_iteration(best_ckpt_path) if best_ckpt_path else None
+            ),
             "best_model_reward": round(state.best_model_reward, 2),
             "best_model_file": best_ckpt,
             "checkpoint_path": checkpoint_path,
