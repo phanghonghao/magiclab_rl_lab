@@ -451,35 +451,40 @@ class OverfittingDetector:
 
 
 class BestModelTracker:
-    """Track the checkpoint with the highest smoothed reward."""
+    """Track the checkpoint with the highest smoothed reward.
 
-    def __init__(self, window: int = 10):
-        self.window = window
+    Only evaluates at checkpoint iterations (multiples of ``save_interval``),
+    using a window equal to ``save_interval`` for smoothing.  This ensures the
+    selected ``best_model_iter`` always corresponds to an actual saved
+    checkpoint file.
+    """
+
+    def __init__(self, save_interval: int = 100):
+        self.save_interval = save_interval
+        self._half_window = max(save_interval // 2, 1)
 
     def update(self, state: RunState) -> None:
-        """Update best model based on smoothed reward curve."""
-        if len(state.rewards) < self.window:
-            # Not enough data for smoothing — just use raw values
-            for step, reward in state.rewards:
-                if reward > state.best_model_reward:
-                    state.best_model_reward = reward
-                    state.best_model_iter = step
+        """Update best model based on smoothed reward at checkpoint iters."""
+        rewards = state.rewards
+        if not rewards:
             return
 
-        # Compute rolling average
-        rewards = state.rewards
-        n = len(rewards)
-        smoothed: list[tuple[int, float]] = []
-        for i in range(n):
-            start = max(0, i - self.window + 1)
-            window_vals = [v for _, v in rewards[start : i + 1]]
-            avg = sum(window_vals) / len(window_vals)
-            smoothed.append((rewards[i][0], avg))
+        half = self._half_window
 
-        # Find peak of smoothed curve
-        for step, sr in smoothed:
-            if sr > state.best_model_reward:
-                state.best_model_reward = sr
+        # Build index for fast range lookups
+        for i, (step, _) in enumerate(rewards):
+            if step % self.save_interval != 0:
+                continue
+
+            # Window around this checkpoint iter
+            start = max(0, i - half)
+            end = min(len(rewards), i + half + 1)
+            window_vals = [v for _, v in rewards[start:end]]
+            if not window_vals:
+                continue
+            avg = sum(window_vals) / len(window_vals)
+            if avg > state.best_model_reward:
+                state.best_model_reward = avg
                 state.best_model_iter = step
 
 
@@ -739,7 +744,7 @@ def analyze_run(run_dir: str, cfg: MonitorConfig, reporter: ReportGenerator) -> 
             state.peak_entropy = ent
 
     # Best model (smoothed)
-    tracker = BestModelTracker(window=10)
+    tracker = BestModelTracker(save_interval=100)
     tracker.update(state)
 
     # -- Overfitting detection --------------------------------------------- #
@@ -864,7 +869,7 @@ def incremental_update(state: RunState, cfg: MonitorConfig) -> None:
         if ent > state.peak_entropy:
             state.peak_entropy = ent
 
-    tracker = BestModelTracker(window=10)
+    tracker = BestModelTracker(save_interval=100)
     tracker.update(state)
 
 
@@ -896,7 +901,7 @@ def run_realtime(cfg: MonitorConfig) -> None:
     state = RunState(run_name=run_name, run_dir=active_dir)
     reporter = ReportGenerator(cfg)
     detector = OverfittingDetector(cfg)
-    tracker = BestModelTracker(window=10)
+    tracker = BestModelTracker(save_interval=100)
 
     # Initial full load
     incremental_update(state, cfg)

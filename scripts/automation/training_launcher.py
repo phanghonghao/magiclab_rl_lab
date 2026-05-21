@@ -122,6 +122,7 @@ class TrainingLauncher:
             f"--run_name={run_name}",
             "--headless",
             "--distributed",
+            "--disable_fabric",
             f"--num_envs={num_envs}",
             f"--max_iterations={max_iterations}",
         ]

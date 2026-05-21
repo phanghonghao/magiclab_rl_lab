@@ -62,6 +62,7 @@ class EmbeddedMonitor:
         action_rate_threshold: float = -1.0,
         min_iterations: int = 2000,
         reward_decline_pct: float = 20.0,
+        save_interval: int = 100,
     ):
         self._cfg = MonitorConfig(
             log_root=log_root,
@@ -71,7 +72,7 @@ class EmbeddedMonitor:
             reward_decline_pct=reward_decline_pct,
         )
         self._detector = OverfittingDetector(self._cfg)
-        self._tracker = BestModelTracker(window=10)
+        self._tracker = BestModelTracker(save_interval=save_interval)
         self._on_overfitting = on_overfitting
 
         self._state: Optional[RunState] = None

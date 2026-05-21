@@ -392,7 +392,7 @@ class PhaseOrchestrator:
 
         # 6) Wait for Isaac Sim to create run directory
         # Multi-GPU Isaac Sim init can take 10+ minutes
-        max_attempts = 28 if self._num_gpus > 1 else 16
+        max_attempts = 56 if self._num_gpus > 1 else 20
         logger.info("Waiting for Isaac Sim to create run directory...")
         run_dir = None
         for attempt in range(max_attempts):
@@ -413,6 +413,7 @@ class PhaseOrchestrator:
 
         # 7) Setup monitor
         monitor_cfg = sp.monitor
+        save_interval = sp.ppo.get("save_interval", 100)
         self._monitor = EmbeddedMonitor(
             log_root=str(self._log_root),
             terrain_type=sp.terrain,
@@ -420,6 +421,7 @@ class PhaseOrchestrator:
             action_rate_threshold=monitor_cfg.get("action_rate_threshold", -1.0),
             min_iterations=monitor_cfg.get("min_iterations", 2000),
             reward_decline_pct=monitor_cfg.get("reward_decline_pct", 20.0),
+            save_interval=save_interval,
         )
         self._monitor.start(run_dir)
         self._monitor.reset_for_new_phase()
