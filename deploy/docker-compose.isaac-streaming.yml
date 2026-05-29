@@ -1,0 +1,35 @@
+services:
+  isaac-sim-streaming:
+    image: ${ISAACSIM_IMAGE:-nvcr.io/nvidia/isaac-sim:5.1.0}
+    container_name: ${CONTAINER_NAME:-isaac-sim-streaming}
+    runtime: nvidia
+    network_mode: host
+    ipc: host
+    stdin_open: true
+    tty: true
+    environment:
+      - ACCEPT_EULA=Y
+      - PRIVACY_CONSENT=Y
+      - CARB_APP_PATH=/isaac-sim/kit
+      - PUBLIC_IP=${PUBLIC_IP}
+      - SIGNAL_PORT=${SIGNAL_PORT:-49100}
+      - STREAM_PORT=${STREAM_PORT:-47998}
+    volumes:
+      - ${HOME}/docker/isaac-sim/cache/kit:/isaac-sim/kit/cache:rw
+      - ${HOME}/docker/isaac-sim/cache/ov:/root/.cache/ov:rw
+      - ${HOME}/docker/isaac-sim/cache/pip:/root/.cache/pip:rw
+      - ${HOME}/docker/isaac-sim/cache/glcache:/root/.cache/nvidia/GLCache:rw
+      - ${HOME}/docker/isaac-sim/cache/computecache:/root/.nv/ComputeCache:rw
+      - ${HOME}/docker/isaac-sim/logs:/root/.nvidia-omniverse/logs:rw
+      - ${HOME}/docker/isaac-sim/data:/root/.local/share/ov/data:rw
+      - ${HOME}/docker/isaac-sim/documents:/root/Documents:rw
+    command:
+      - bash
+      - -lc
+      - >
+        test -n "${PUBLIC_IP}" ||
+        (echo "PUBLIC_IP is required. Example: PUBLIC_IP=203.0.113.10 docker compose up" && exit 1);
+        ./runheadless.sh
+        --/exts/omni.kit.livestream.app/primaryStream/publicIp=${PUBLIC_IP}
+        --/exts/omni.kit.livestream.app/primaryStream/signalPort=${SIGNAL_PORT}
+        --/exts/omni.kit.livestream.app/primaryStream/streamPort=${STREAM_PORT}

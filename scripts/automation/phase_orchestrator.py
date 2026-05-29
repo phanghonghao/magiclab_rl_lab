@@ -19,25 +19,25 @@ Usage::
 
     # Full pipeline
     python -m automation.phase_orchestrator \\
-        --plan training_plans/z1_5phase_plan.yaml \\
+        --plan training_plans/z1_custom_5phase_plan.yaml \\
         --num-gpus 4
 
     # Dry run
     python -m automation.phase_orchestrator \\
-        --plan training_plans/z1_5phase_plan.yaml --dry-run
+        --plan training_plans/z1_custom_5phase_plan.yaml --dry-run
 
     # Smoke test (verify pipeline with minimal iterations)
     python -m automation.phase_orchestrator \\
-        --plan training_plans/z1_5phase_plan.yaml --smoke-test --num-gpus 4
+        --plan training_plans/z1_custom_5phase_plan.yaml --smoke-test --num-gpus 4
 
     # Start from specific sub-phase
     python -m automation.phase_orchestrator \\
-        --plan training_plans/z1_5phase_plan.yaml \\
+        --plan training_plans/z1_custom_5phase_plan.yaml \\
         --start-from p3_coarse --num-gpus 4
 
     # Fresh start (ignore saved state)
     python -m automation.phase_orchestrator \\
-        --plan training_plans/z1_5phase_plan.yaml --fresh --num-gpus 4
+        --plan training_plans/z1_custom_5phase_plan.yaml --fresh --num-gpus 4
 """
 
 from __future__ import annotations

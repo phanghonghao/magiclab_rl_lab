@@ -24,14 +24,66 @@ parser.add_argument("--checkpoint", type=str, default=None, help="Path to model 
 parser.add_argument("--policy", type=str, default=None, help="Path to JIT-exported policy (.pt).")
 parser.add_argument("--seed", type=int, default=None, help="Random seed.")
 parser.add_argument("--video", action="store_true", default=False, help="Record video.")
-parser.add_argument("--video_length", type=int, default=200, help="Length of recorded video (in steps).")
+parser.add_argument("--video_length", type=int, default=1000, help="Length of recorded video (in steps).")
 parser.add_argument("--max_steps", type=int, default=800, help="Max steps when not recording video.")
+parser.add_argument(
+    "--disable_fabric",
+    action="store_true",
+    default=False,
+    help="Disable Fabric and fall back to USD I/O.",
+)
 parser.add_argument("--no_camera_track", action="store_true", default=False,
                     help="Disable camera tracking (camera stays at default position).")
 parser.add_argument("--camera_distance", type=float, default=3.5,
                     help="Camera distance from robot for tracking (default: 3.5).")
 parser.add_argument("--camera_height", type=float, default=1.5,
                     help="Camera height above robot for tracking (default: 1.5).")
+parser.add_argument(
+    "--terrain",
+    type=str,
+    default="default",
+    choices=["default", "plane", "stair", "stair_ring"],
+    help=(
+        "Terrain override for recording. "
+        "'default' uses the env config; "
+        "'plane' forces flat plane; "
+        "'stair' uses official pyramid stairs with one-way upward traversal; "
+        "'stair_ring' keeps the older ring-style inverted stairs."
+    ),
+)
+parser.add_argument(
+    "--command_resample_time",
+    type=float,
+    default=None,
+    help="Override base velocity command resampling time in seconds.",
+)
+parser.add_argument("--fixed_vel_x", type=float, default=None, help="Fix commanded forward velocity (m/s).")
+parser.add_argument("--fixed_vel_y", type=float, default=None, help="Fix commanded lateral velocity (m/s).")
+parser.add_argument("--fixed_vel_yaw", type=float, default=None, help="Fix commanded yaw rate (rad/s).")
+parser.add_argument(
+    "--stair_start_x_min",
+    type=float,
+    default=-3.4,
+    help="For stair terrain, minimum robot start x so it walks before climbing.",
+)
+parser.add_argument(
+    "--stair_start_x_max",
+    type=float,
+    default=-1.8,
+    help="For stair terrain, maximum robot start x so it walks before climbing.",
+)
+parser.add_argument(
+    "--active_gpu",
+    type=int,
+    default=None,
+    help="Explicit Omniverse renderer GPU index. Defaults to the index parsed from --device.",
+)
+parser.add_argument(
+    "--physics_gpu",
+    type=int,
+    default=None,
+    help="Explicit PhysX GPU index. Defaults to the index parsed from --device.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -45,6 +97,23 @@ if args_cli.checkpoint and args_cli.policy:
 if args_cli.video:
     args_cli.enable_cameras = True
 
+
+def _parse_gpu_index_from_device(device: str | None) -> int | None:
+    if not device or not device.startswith("cuda:"):
+        return None
+    try:
+        return int(device.split(":", 1)[1])
+    except ValueError:
+        return None
+
+
+gpu_index = _parse_gpu_index_from_device(getattr(args_cli, "device", None))
+if args_cli.active_gpu is None:
+    args_cli.active_gpu = gpu_index
+if args_cli.physics_gpu is None:
+    args_cli.physics_gpu = gpu_index
+args_cli.multi_gpu = False
+
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
@@ -54,6 +123,7 @@ import numpy as np
 import gymnasium as gym
 import importlib
 import importlib.metadata as metadata
+import isaaclab.terrains as terrain_gen
 
 import isaaclab_tasks  # noqa: F401
 import magiclab_rl_lab.tasks  # noqa: F401 - registers Magiclab-Z1-12dof-Velocity
@@ -160,6 +230,164 @@ def _maybe_flush_vel_log(vel_log, log_dir, step):
         _save_vel_log(vel_log, log_dir)
 
 
+def _set_equal_command_range(command_cfg, vel_x: float, vel_y: float, vel_yaw: float):
+    ranges_cls = type(command_cfg.ranges)
+    fixed_ranges = ranges_cls(
+        lin_vel_x=(vel_x, vel_x),
+        lin_vel_y=(vel_y, vel_y),
+        ang_vel_z=(vel_yaw, vel_yaw),
+    )
+    command_cfg.ranges = fixed_ranges
+    if hasattr(command_cfg, "limit_ranges"):
+        command_cfg.limit_ranges = fixed_ranges
+    command_cfg.rel_standing_envs = 0.0
+    command_cfg.rel_heading_envs = 0.0
+    command_cfg.heading_command = False
+
+
+def _build_stair_terrain_cfg(terrain_gen):
+    return terrain_gen.TerrainGeneratorCfg(
+        size=(8.0, 8.0),
+        border_width=20.0,
+        num_rows=1,
+        num_cols=1,
+        horizontal_scale=0.1,
+        vertical_scale=0.005,
+        slope_threshold=0.75,
+        difficulty_range=(1.0, 1.0),
+        use_cache=False,
+        sub_terrains={
+            "stair": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
+                proportion=1.0,
+                step_height_range=(0.08, 0.12),
+                step_width=0.35,
+                platform_width=2.0,
+                border_width=1.0,
+                holes=False,
+            ),
+        },
+    )
+
+
+def _build_one_way_stair_terrain_cfg(terrain_gen):
+    return terrain_gen.TerrainGeneratorCfg(
+        size=(8.0, 8.0),
+        border_width=20.0,
+        num_rows=1,
+        num_cols=1,
+        horizontal_scale=0.1,
+        vertical_scale=0.005,
+        slope_threshold=0.75,
+        difficulty_range=(1.0, 1.0),
+        use_cache=False,
+        sub_terrains={
+            "stair": terrain_gen.MeshPyramidStairsTerrainCfg(
+                proportion=1.0,
+                step_height_range=(0.08, 0.12),
+                step_width=0.35,
+                platform_width=2.0,
+                border_width=1.0,
+                holes=False,
+            ),
+        },
+    )
+
+
+def _apply_recording_reset_policy(env_cfg):
+    reset_base = getattr(getattr(env_cfg, "events", None), "reset_base", None)
+    if reset_base is not None and hasattr(reset_base, "params"):
+        pose_range = {
+            "x": (0.0, 0.0),
+            "y": (0.0, 0.0),
+            "yaw": (0.0, 0.0),
+        }
+        if args_cli.terrain == "stair":
+            # Keep heading aligned with the +x climb direction, but randomize the
+            # start distance so the robot walks before reaching the stairs.
+            x_min = min(args_cli.stair_start_x_min, args_cli.stair_start_x_max)
+            x_max = max(args_cli.stair_start_x_min, args_cli.stair_start_x_max)
+            pose_range["x"] = (x_min, x_max)
+            pose_range["y"] = (0.0, 0.0)
+        reset_base.params["pose_range"] = pose_range
+        reset_base.params["velocity_range"] = {
+            "x": (0.0, 0.0),
+            "y": (0.0, 0.0),
+            "z": (0.0, 0.0),
+            "roll": (0.0, 0.0),
+            "pitch": (0.0, 0.0),
+            "yaw": (0.0, 0.0),
+        }
+        print(
+            "[INFO] Reset override:"
+            f" pose={reset_base.params['pose_range']},"
+            f" velocity={reset_base.params['velocity_range']}",
+            flush=True,
+        )
+
+    push_robot = getattr(getattr(env_cfg, "events", None), "push_robot", None)
+    if push_robot is not None:
+        if hasattr(push_robot, "interval_range_s"):
+            push_robot.interval_range_s = (1.0e9, 1.0e9)
+        if hasattr(push_robot, "params"):
+            push_robot.params["velocity_range"] = {"x": (0.0, 0.0), "y": (0.0, 0.0)}
+        print("[INFO] Disabled push_robot disturbance for recording.", flush=True)
+
+
+def _apply_recording_overrides(env_cfg):
+    if args_cli.terrain == "plane":
+        env_cfg.scene.terrain.terrain_type = "plane"
+        env_cfg.scene.terrain.terrain_generator = None
+        if hasattr(env_cfg.scene.terrain, "max_init_terrain_level"):
+            env_cfg.scene.terrain.max_init_terrain_level = 0
+        print("[INFO] Terrain override: plane", flush=True)
+    elif args_cli.terrain == "stair":
+        env_cfg.scene.terrain.terrain_type = "generator"
+        env_cfg.scene.terrain.terrain_generator = _build_one_way_stair_terrain_cfg(terrain_gen)
+        if hasattr(env_cfg.scene.terrain, "max_init_terrain_level"):
+            env_cfg.scene.terrain.max_init_terrain_level = 0
+        print("[INFO] Terrain override: stair (official pyramid stairs, one-way +x climb)", flush=True)
+    elif args_cli.terrain == "stair_ring":
+        env_cfg.scene.terrain.terrain_type = "generator"
+        env_cfg.scene.terrain.terrain_generator = _build_stair_terrain_cfg(terrain_gen)
+        if hasattr(env_cfg.scene.terrain, "max_init_terrain_level"):
+            env_cfg.scene.terrain.max_init_terrain_level = 0
+        print("[INFO] Terrain override: stair_ring (inverted ring stairs)", flush=True)
+    else:
+        print("[INFO] Terrain override: default", flush=True)
+
+    if args_cli.command_resample_time is not None:
+        env_cfg.commands.base_velocity.resampling_time_range = (
+            args_cli.command_resample_time,
+            args_cli.command_resample_time,
+        )
+        print(
+            f"[INFO] Command resample time override: {args_cli.command_resample_time:.3f}s",
+            flush=True,
+        )
+
+    fixed_velocity_requested = any(
+        value is not None for value in (args_cli.fixed_vel_x, args_cli.fixed_vel_y, args_cli.fixed_vel_yaw)
+    )
+    if fixed_velocity_requested:
+        vel_x = 0.0 if args_cli.fixed_vel_x is None else args_cli.fixed_vel_x
+        vel_y = 0.0 if args_cli.fixed_vel_y is None else args_cli.fixed_vel_y
+        vel_yaw = 0.0 if args_cli.fixed_vel_yaw is None else args_cli.fixed_vel_yaw
+        _set_equal_command_range(env_cfg.commands.base_velocity, vel_x, vel_y, vel_yaw)
+        print(
+            f"[INFO] Fixed velocity override: vx={vel_x:.3f}, vy={vel_y:.3f}, yaw={vel_yaw:.3f}",
+            flush=True,
+        )
+    else:
+        ranges = env_cfg.commands.base_velocity.ranges
+        print(
+            "[INFO] Command range:"
+            f" vx={ranges.lin_vel_x}, vy={ranges.lin_vel_y}, yaw={ranges.ang_vel_z}",
+            flush=True,
+        )
+
+    _apply_recording_reset_policy(env_cfg)
+
+
 def main():
     try:
         # === Env config (play mode) ===
@@ -198,10 +426,12 @@ def main():
         print("[INFO] Cleared USD cache", flush=True)
 
         env_cfg.scene.robot.spawn.force_usd_conversion = True
-        env_cfg.sim.use_fabric = False
+        env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+        env_cfg.sim.use_fabric = not args_cli.disable_fabric
         env_cfg.scene.num_envs = args_cli.num_envs
         if args_cli.seed is not None:
             env_cfg.seed = args_cli.seed
+        _apply_recording_overrides(env_cfg)
 
         log_dir = os.path.dirname(CKPT) if not USE_JIT else os.path.dirname(os.path.dirname(CKPT))
         if hasattr(env_cfg, 'log_dir'):

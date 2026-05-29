@@ -1179,86 +1179,108 @@ def parse_args():
     return parser.parse_args()
 
 
-def _write_best_models_json(results: list[RunState], cfg: MonitorConfig) -> None:
-    """Write a consolidated best_models.json at log_root level.
+def _categorize_run_dir(run_dir_name: str) -> str:
+    """Map a run directory to one of the persisted best-model categories."""
+    name = run_dir_name.lower()
+    if "amp" in name:
+        return "AMP"
+    if "_coarse" in name or "_fine" in name:
+        return "custom"
+    return "legged"
 
-    This file is read by the gpu-train skill's --sim command to auto-find
-    the best checkpoint for any training version.
-    """
+
+def _build_best_model_entry(state: RunState) -> dict | None:
+    """Convert a run state into a persisted summary entry."""
+    if not state.rewards or state.peak_reward == -float("inf"):
+        return None
+
+    run_dir_name = Path(state.run_dir).name
+    version = run_dir_name
+    for part in run_dir_name.split("_"):
+        if part.startswith("v") and any(c.isdigit() for c in part):
+            idx = run_dir_name.index(part)
+            version = run_dir_name[idx:]
+            version = version.replace("z1_locomotion_", "")
+            break
+
+    best_ckpt_path = CheckpointAnalyzer.resolve_checkpoint(state.run_dir, state.best_model_iter)
+    best_ckpt = best_ckpt_path.name if best_ckpt_path else f"model_{state.best_model_iter}.pt"
+    checkpoint_path = str(best_ckpt_path) if best_ckpt_path else str(Path(state.run_dir) / best_ckpt)
+
+    return {
+        "version": version,
+        "run_dir": run_dir_name,
+        "category": _categorize_run_dir(run_dir_name),
+        "status": "HEALTHY" if not state.overfitting_detected else "OVERFITTING",
+        "overfitting_reason": state.overfitting_reason,
+        "latest_iteration": state.rewards[-1][0] if state.rewards else 0,
+        "latest_reward": state.rewards[-1][1] if state.rewards else 0,
+        "peak_reward": round(state.peak_reward, 2),
+        "peak_reward_iter": state.peak_reward_iter,
+        "best_model_iteration": state.best_model_iter,
+        "best_checkpoint_iteration": (
+            CheckpointAnalyzer.get_iteration(best_ckpt_path) if best_ckpt_path else None
+        ),
+        "best_model_reward": round(state.best_model_reward, 2),
+        "best_model_file": best_ckpt,
+        "checkpoint_path": checkpoint_path,
+        "latest_action_rate": state.action_rates[-1][1] if state.action_rates else None,
+        "latest_std": list(state.std_values.values())[-1] if state.std_values else None,
+        "latest_time_out": state.time_outs[-1][1] if state.time_outs else None,
+        "latest_episode_length": state.episode_lengths[-1][1] if state.episode_lengths else None,
+        "latest_bad_orientation": state.bad_orientations[-1][1] if state.bad_orientations else None,
+        "latest_vel_error": state.vel_errors[-1][1] if state.vel_errors else None,
+    }
+
+
+def _write_best_models_json(results: list[RunState], cfg: MonitorConfig) -> None:
+    """Write categorized best-model summaries at log_root level."""
     log_root = Path(cfg.log_root)
     if not log_root.is_dir():
         log_root = Path(cfg.run_dir).parent if cfg.run_dir else None
         if not log_root:
             return
 
-    entries = []
+    category_entries = {
+        "legged": [],
+        "custom": [],
+        "AMP": [],
+    }
     for state in results:
-        # Skip runs with no meaningful data
-        if not state.rewards or state.peak_reward == -float("inf"):
+        entry = _build_best_model_entry(state)
+        if entry is None:
             continue
-        # Extract short version name from run directory
-        # e.g. "2026-05-01_04-50-05_z1_locomotion_s4_gentle_terrain" -> "s4_gentle"
-        run_dir_name = Path(state.run_dir).name
-        version = run_dir_name
-        # Try to extract version identifier
-        for part in run_dir_name.split("_"):
-            if part.startswith("v") and any(c.isdigit() for c in part):
-                # Collect remaining parts after version number
-                idx = run_dir_name.index(part)
-                version = run_dir_name[idx:]
-                # Remove z1_locomotion_ prefix
-                version = version.replace("z1_locomotion_", "")
-                break
+        category_entries[entry["category"]].append(entry)
 
-        best_ckpt_path = CheckpointAnalyzer.resolve_checkpoint(state.run_dir, state.best_model_iter)
-        best_ckpt = best_ckpt_path.name if best_ckpt_path else f"model_{state.best_model_iter}.pt"
-        checkpoint_path = str(best_ckpt_path) if best_ckpt_path else str(Path(state.run_dir) / best_ckpt)
-
-        entries.append({
-            "version": version,
-            "run_dir": run_dir_name,
-            "status": "HEALTHY" if not state.overfitting_detected else "OVERFITTING",
-            "overfitting_reason": state.overfitting_reason,
-            "latest_iteration": state.rewards[-1][0] if state.rewards else 0,
-            "latest_reward": state.rewards[-1][1] if state.rewards else 0,
-            "peak_reward": round(state.peak_reward, 2),
-            "peak_reward_iter": state.peak_reward_iter,
-            "best_model_iteration": state.best_model_iter,
-            "best_checkpoint_iteration": (
-                CheckpointAnalyzer.get_iteration(best_ckpt_path) if best_ckpt_path else None
-            ),
-            "best_model_reward": round(state.best_model_reward, 2),
-            "best_model_file": best_ckpt,
-            "checkpoint_path": checkpoint_path,
-            "latest_action_rate": state.action_rates[-1][1] if state.action_rates else None,
-            "latest_std": list(state.std_values.values())[-1] if state.std_values else None,
-            "latest_time_out": state.time_outs[-1][1] if state.time_outs else None,
-            "latest_episode_length": state.episode_lengths[-1][1] if state.episode_lengths else None,
-            "latest_bad_orientation": state.bad_orientations[-1][1] if state.bad_orientations else None,
-            "latest_vel_error": state.vel_errors[-1][1] if state.vel_errors else None,
-        })
-
-    # Sort by best reward descending
-    entries.sort(key=lambda x: x["best_model_reward"], reverse=True)
-
-    output = {
-        "generated_at": datetime.now().isoformat(),
-        "log_root": str(log_root),
-        "total_runs": len(results),
-        "models": entries,
+    generated_at = datetime.now().isoformat()
+    total_runs = len(results)
+    filename_map = {
+        "legged": "best_models_legged.json",
+        "custom": "best_models_custom.json",
+        "AMP": "best_models_AMP.json",
     }
 
-    output_path = log_root / "best_models.json"
-    with open(output_path, "w") as f:
-        json.dump(output, f, indent=2, ensure_ascii=False)
+    for category, entries in category_entries.items():
+        entries.sort(key=lambda x: x["best_model_reward"], reverse=True)
+        output = {
+            "generated_at": generated_at,
+            "log_root": str(log_root),
+            "category": category,
+            "total_runs": total_runs,
+            "models": entries,
+        }
 
-    print(f"[MONITOR] Best models summary written to: {output_path}")
-    print(f"[MONITOR] {len(entries)} runs with data, top: ", end="")
-    if entries:
-        top = entries[0]
-        print(f"{top['version']} -> {top['best_model_file']} (reward: {top['best_model_reward']})")
-    else:
-        print("(no data)")
+        output_path = log_root / filename_map[category]
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(output, f, indent=2, ensure_ascii=False)
+
+        print(f"[MONITOR] Best models summary written to: {output_path}")
+        print(f"[MONITOR] {category}: {len(entries)} runs with data, top: ", end="")
+        if entries:
+            top = entries[0]
+            print(f"{top['version']} -> {top['best_model_file']} (reward: {top['best_model_reward']})")
+        else:
+            print("(no data)")
 
 
 def main():
@@ -1314,7 +1336,7 @@ def main():
                 import traceback
                 traceback.print_exc()
 
-        # Write consolidated best_models.json at log_root level
+        # Write categorized best-model summaries at log_root level
         _write_best_models_json(results, cfg)
     else:
         # -- Continuous mode ---------------------------------------------- #

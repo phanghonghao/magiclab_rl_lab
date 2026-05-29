@@ -13,9 +13,9 @@
 #   - base_height reward gradually increased (-1.0 -> -3.0)
 #
 # Usage:
-#   python -m automation.phase_orchestrator --plan training_plans/z1_4phase_plan_v2.yaml
-#   python -m automation.phase_orchestrator --plan training_plans/z1_4phase_plan_v2.yaml --start-from p1
-#   python -m automation.phase_orchestrator --plan training_plans/z1_4phase_plan_v2.yaml --dry-run
+#   python -m automation.phase_orchestrator --plan training_plans/z1_legged_gym_4phase_plan.yaml
+#   python -m automation.phase_orchestrator --plan training_plans/z1_legged_gym_4phase_plan.yaml --start-from p1
+#   python -m automation.phase_orchestrator --plan training_plans/z1_legged_gym_4phase_plan.yaml --dry-run
 
 plan_name: z1_4phase_v2
 num_gpus: 4
